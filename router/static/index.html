@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Model Deck</title>
+<style>
+:root {
+  --bg: #11151c; --surface: #171e28; --border: #273244;
+  --text: #e7edf6; --muted: #8d9aac; --accent: #2563eb;
+  --green: #6ee7b7; --red: #fca5a5; --card: #171e28;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; min-height: 100vh; }
+header { padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
+header h1 { font-size: 20px; font-weight: 700; }
+.badge { background: #123b33; color: var(--green); padding: 4px 10px; border-radius: 10px; font-size: 12px; font-weight: 700; }
+tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); }
+tab { padding: 10px 18px; cursor: pointer; font-weight: 600; color: var(--muted); border-bottom: 2px solid transparent; }
+tab.active { color: var(--text); border-bottom-color: var(--accent); }
+main { padding: 16px; max-width: 700px; margin: 0 auto; }
+.view { display: none; }
+.view.active { display: block; }
+card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+card h3 { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 10px; }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+input, select, textarea { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px; color: var(--text); font-size: 13px; margin-bottom: 10px; }
+textarea { min-height: 80px; resize: vertical; font-family: monospace; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+.row > * { flex: 1; }
+button { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px 14px; color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; }
+button.primary { background: var(--accent); border-color: #3b82f6; }
+button.danger { background: #3f1d1d; border-color: #7f1d1d; color: var(--red); }
+button:disabled { opacity: 0.4; cursor: default; }
+.status-chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+.chip { padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; background: var(--surface); border: 1px solid var(--border); }
+.chip.running { background: #1e3a5f; border-color: #2563eb; color: #93c5fd; }
+.chip.done { background: #123b33; border-color: #14b8a6; color: var(--green); }
+.chip.failed { background: #3f1d1d; border-color: #7f1d1d; color: var(--red); }
+.chip.skipped { background: #292020; border-color: #57534e; color: #a8a29e; }
+#output { background: #0b0f14; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: monospace; font-size: 12px; min-height: 200px; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-top: 10px; }
+.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+.modal-overlay.show { display: flex; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; max-width: 400px; width: 90%; }
+.modal h3 { margin-bottom: 10px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.metric { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+.metric .label { font-size: 10px; color: var(--muted); font-weight: 700; text-transform: uppercase; }
+.metric .value { font-size: 16px; font-weight: 700; margin-top: 4px; }
+.alert-banner { background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 8px; padding: 12px; margin-bottom: 12px; display: none; }
+.alert-banner.show { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Model Deck</h1>
+  <span class="badge" id="activeBadge">ACTIVE · —</span>
+</header>
+<div style="display:flex;gap:0;border-bottom:1px solid var(--border);">
+  <div id="tab-deck" class="tab active" onclick="switchTab('deck')">Deck</div>
+  <div id="tab-reports" class="tab" onclick="switchTab('reports')">Reports</div>
+  <div id="tab-admin" class="tab" onclick="switchTab('admin')">Admin</div>
+</div>
+<main>
+  <!-- DECK VIEW -->
+  <div id="view-deck" class="view active">
+    <card>
+      <h3>Phase Switch</h3>
+      <div class="row">
+        <button onclick="setActive('scout')">Scout</button>
+        <button onclick="setActive('planner')">Planner</button>
+        <button onclick="setActive('builder')">Builder</button>
+        <button onclick="setActive('auditor')">Auditor</button>
+      </div>
+    </card>
+    <card>
+      <h3>API Key</h3>
+      <div id="keyStatus">○ No API key stored</div>
+      <div class="row" style="margin-top:8px;">
+        <input id="apiKeyInput" type="password" placeholder="sk-…" style="flex:2;">
+        <button class="primary" onclick="saveKey()">Save</button>
+      </div>
+    </card>
+    <card id="rolesCard">
+      <h3>Roles</h3>
+      <div id="rolesContainer"></div>
+    </card>
+    <card>
+      <h3>GPT Planner</h3>
+      <label>Backend</label>
+      <select id="plannerKind"><option value="openai">Cloud (OpenAI)</option><option value="local">Local model</option></select>
+      <p class="hint">On "Local model" the planner runs its own role below
+      (Planner, port 8008) -- the two fields here apply to the cloud backend only.</p>
+      <label>Cloud model</label>
+      <input id="plannerModel">
+      <label>Cloud reasoning effort</label>
+      <select id="plannerEffort"><option>none</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select>
+      <button class="primary" style="margin-top:8px;" onclick="savePlanner()">Save Planner</button>
+    </card>
+  </div>
+
+  <!-- REPORTS VIEW -->
+  <div id="view-reports" class="view">
+    <div class="alert-banner" id="loopAlert">
+      <strong>Possible stuck loop detected.</strong>
+      <div class="row" style="margin-top:8px;">
+        <button class="danger" onclick="stopLoopAlert()">Stop generation</button>
+        <button onclick="ackLoopAlert()">Keep watching</button>
+      </div>
+    </div>
+    <card>
+      <h3>Pipeline</h3>
+      <label>Path</label>
+      <input id="pipePath" placeholder="/path/to/project">
+      <label>Task</label>
+      <textarea id="pipeTask" placeholder="What the change/investigation is for"></textarea>
+      <label>Start from</label>
+      <select id="pipeStart"><option value="scout">Scout</option><option value="planner">Planner</option><option value="builder">Builder</option><option value="auditor">Auditor</option></select>
+      <div class="row" style="margin-top:10px;">
+        <button class="primary" id="btnFull" onclick="startPipeline('full')">Run Full Suite</button>
+        <button id="btnStep" onclick="startPipeline('step')">Step-by-Step</button>
+        <button id="btnContinue" disabled onclick="continuePipeline()">Continue →</button>
+        <button class="danger" id="btnStop" disabled onclick="stopPipeline()">Stop</button>
+      </div>
+      <div class="status-chips" id="phaseChips"></div>
+      <div id="output"></div>
+    </card>
+    <card>
+      <h3>Telemetry</h3>
+      <div class="metric-grid" id="telemetryGrid">
+        <div class="metric"><div class="label">Status</div><div class="value" id="tStatus">—</div></div>
+        <div class="metric"><div class="label">Context</div><div class="value" id="tContext">—</div></div>
+        <div class="metric"><div class="label">Decode</div><div class="value" id="tDecode">—</div></div>
+        <div class="metric"><div class="label">Elapsed</div><div class="value" id="tElapsed">—</div></div>
+      </div>
+    </card>
+  </div>
+
+  <!-- ADMIN VIEW -->
+  <div id="view-admin" class="view">
+    <div id="promptsContainer"></div>
+  </div>
+</main>
+
+<!-- ASK QUESTION MODAL -->
+<div class="modal-overlay" id="askModal">
+  <div class="modal">
+    <h3 id="askTitle">Question</h3>
+    <p id="askText" style="margin-bottom:12px;"></p>
+    <div id="askOptions"></div>
+    <input id="askAnswer" placeholder="Your answer" style="margin-top:8px;">
+    <button class="primary" style="margin-top:10px;width:100%;" onclick="submitAnswer()">Submit</button>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

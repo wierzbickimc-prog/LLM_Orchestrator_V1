@@ -9,6 +9,43 @@ the way it is.
 
 ## Open
 
+- **A test suite that writes to the operator's real config.** Found by
+  reading a failing run's audit report, not by any test failing:
+  `tests/test_web.py` patched `modeldeck.state.load_state`/`save_state`,
+  but `router/web.py` imports both *by value* at module load, so the
+  patches applied to nothing and the endpoint tests drove the real
+  `~/Library/.../state.json`. A fixture's throwaway role dict silently
+  rewrote scout's `context_window` from 131072 to 8192, and the only
+  symptom would have been "scout got mysteriously worse". Fixed two ways
+  (correct patch targets, plus an autouse fixture pinning
+  `MODEL_DECK_CONFIG_DIR` at a tmp_path), but the general rule is worth
+  keeping: any test that can reach `load_state()` must be sandboxed by
+  environment, not by trusting a mock to be aimed correctly. Audit whether
+  other test modules touching state are similarly exposed.
+
+- **Renovator ran out of turns on a 4-item fix list (40-step cap).** The
+  remote-access build's repair pass stopped at "Stopped after 40 steps
+  without the model signaling completion" -- a safety cap, not a crash.
+  Three of the four items were small test edits. The turn budget is now
+  visible and editable in the Deck tab (`max_steps` per role), and the
+  turn counter is live on the phase label during a run, so this failure
+  mode is at least legible now. Still open: whether 40 is simply too low
+  for a fix list that requires re-reading large test files, or whether the
+  turns were spent chasing the audit's one *misdiagnosed* item (see below).
+
+- **The Auditor can hand the Renovator a confidently wrong fix.** In the
+  remote-access run, the audit attributed 14 of 16 test failures to wrong
+  `@patch` namespaces. The patch targets were genuinely wrong -- but they
+  were not why those tests failed: every one returned 403 because
+  `TestClient`'s default client host is the literal string `"testclient"`,
+  which the new Tailnet allowlist correctly rejects. A repair pass working
+  that fix list would change the patch targets, re-run, and see all 14
+  still failing, with no guidance about why. Worth considering: when the
+  audit has real test output, require each fix-list item to quote the
+  specific failure line it explains, so an item that explains nothing is
+  visible as such.
+
+
 - **The router process doesn't restart when the GUI does, and nothing
   flags that it's running stale code.** Hit live: added a new "renovator"
   router alias, restarted the GUI (which relaunches models but not the

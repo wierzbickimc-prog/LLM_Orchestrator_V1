@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import threading
 import time
@@ -41,52 +40,40 @@ from PySide6.QtWidgets import (
 )
 
 from .mtplx import PROJECT_DIR, ProcessManager, fetch_json, fetch_sse_snapshot, installed_models, post_json
+from .pipeline import PIPELINE_ORDER, STATUS_PHASES, Pipeline
 from .prompts import PROMPTS
 from .secrets import get_openai_api_key, set_openai_api_key
 from .state import activate_local, activate_planner, load_state, sampling_preset, save_state
 
 sys.path.insert(0, str(PROJECT_DIR / "scripts"))
-from report_common import parse_verdict, resolve_ai_path  # noqa: E402
+from report_common import parse_builder_accuracy, parse_verdict, stream_chat  # noqa: E402
 
 
-# Scripts run against the router for each phase -- scout/planner/auditor are
-# single tool-free calls (see scripts/report_common.py); builder is a small
-# purpose-built agent loop (see scripts/builder_agent.py) since it actually
-# has to edit files and run commands, which the others never do.
-REPORT_SCRIPTS: dict[str, dict[str, Any]] = {
-    "scout": {
-        "script": "scout_report.py",
-        "task_required": True,
-        "out": ".ai/scout-report.md",
-        "build_args": lambda task, path: [task, path],
-    },
-    "planner": {
-        "script": "planner_report.py",
-        "task_required": False,
-        "out": ".ai/implementation-plan.md",
-        "build_args": lambda task, path: [path, *(["--task", task] if task else [])],
-    },
-    "builder": {
-        "script": "builder_agent.py",
-        "task_required": False,
-        "out": ".ai/builder-report.md",
-        "build_args": lambda task, path: [path, *(["--task", task] if task else [])],
-    },
-    "auditor": {
-        "script": "auditor_report.py",
-        "task_required": False,
-        "out": ".ai/audit-report.md",
-        "build_args": lambda task, path: [path, *(["--task", task] if task else [])],
-    },
-    "renovator": {
-        "script": "renovator_agent.py",
-        "task_required": False,
-        "out": ".ai/renovator-report.md",
-        # Scope comes entirely from audit-report.md's Fix List, not a free-form
-        # task -- see renovator_agent.py's docstring.
-        "build_args": lambda task, path: [path],
-    },
-}
+def _thousands(value: int) -> str:
+    """Token counts get big enough that raw digits stop being readable at a
+    glance, which is the only reason these labels exist."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
+CHAT_SYSTEM_PROMPT = (
+    "You are helping the user turn a rough idea into a precise, buildable "
+    "prompt for an automated coding pipeline (scout, planner, builder, "
+    "auditor). That pipeline gets no chance to ask follow-up questions once "
+    "it starts, so your job is to surface the ambiguities now: ask about "
+    "scope, target files, constraints, and what \"done\" looks like. When the "
+    "user asks for the prompt, output it as a single self-contained block of "
+    "prose with no preamble, stating the goal, the constraints, and the "
+    "acceptance criteria explicitly."
+)
+
+
+class ChatBridge(QObject):
+    chunk = Signal(str)
+    finished = Signal(bool, str)  # success, full text or error
 
 
 class Bridge(QObject):
@@ -98,25 +85,6 @@ class ReportBridge(QObject):
     finished = Signal(str, bool, str)  # phase, success, report content or error text
     chunk = Signal(str, str)  # phase, text piece as it streams in
     ask_question = Signal(str, str)  # phase, JSON {"question": ..., "options": [...] | None}
-
-
-PIPELINE_ORDER: tuple[str, ...] = ("scout", "planner", "builder", "auditor")
-# Renovator only ever runs after an Auditor REJECT, appended to the queue
-# dynamically (see MainWindow._report_finished) -- but its status label is
-# created up front alongside the other four so the row doesn't jump around
-# when the loop actually fires.
-STATUS_PHASES: tuple[str, ...] = PIPELINE_ORDER + ("renovator",)
-MAX_RENOVATOR_RETRIES = 1
-# What must already exist under <path>/.ai/ to start a run at this phase
-# instead of from Scout -- e.g. resuming at Builder after a Stop or a
-# rejected-twice Auditor verdict, without redoing Scout/Planner. Scout has
-# no prerequisite: it scans the target fresh.
-REQUIRED_ARTIFACT_FOR_START: dict[str, str] = {
-    "scout": "",
-    "planner": "scout-report.md",
-    "builder": "implementation-plan.md",
-    "auditor": "implementation-plan.md",
-}
 
 
 class PipelinePanel(QGroupBox):
@@ -145,11 +113,6 @@ class PipelinePanel(QGroupBox):
         self.task_field.setMinimumHeight(140)
         layout.addWidget(self.task_field)
 
-        # Lets a run resume after a stop -- a rejected Auditor verdict that
-        # used up its retry, a manual Stop click, or a crash -- without
-        # redoing already-completed (and possibly expensive) earlier phases.
-        # Starting anywhere but Scout requires that phase's input artifact
-        # to already exist on disk (checked in MainWindow._start_pipeline).
         start_row = QHBoxLayout()
         start_row.addWidget(QLabel("Start from"))
         self.start_phase = QComboBox()
@@ -174,18 +137,23 @@ class PipelinePanel(QGroupBox):
         run_row.addWidget(self.stop_button)
         layout.addLayout(run_row)
 
-        # Grid, not a single row -- five labels (four phases plus the
-        # conditional Renovator) in one QHBoxLayout get squeezed/clipped on
-        # a narrower window instead of wrapping, which is exactly the kind
-        # of "I can't tell what's happening" gap this row exists to avoid.
         status_columns = 3
         status_grid = QGridLayout()
         self.phase_status: dict[str, QLabel] = {}
+        # Each phase label reads "Phase: <state> - <stats>". The state half is
+        # rewritten constantly (a per-second running timer); the stats half
+        # accumulates as the run produces it (turns as they're taken, tokens
+        # and accuracy only at the end). Keeping the two halves separate is
+        # what stops the timer tick from wiping out stats that arrived
+        # earlier, and stops a late stat from erasing the elapsed time.
+        self.phase_state: dict[str, str] = {}
+        self.phase_stats: dict[str, dict[str, str]] = {}
         for index, phase in enumerate(STATUS_PHASES):
             label = QLabel(f"{phase.title()}: pending")
             label.setObjectName("reportStatus")
             status_grid.addWidget(label, index // status_columns, index % status_columns)
             self.phase_status[phase] = label
+            self.phase_state[phase] = "pending"
         layout.addLayout(status_grid)
 
         self.output = QPlainTextEdit()
@@ -205,9 +173,28 @@ class PipelinePanel(QGroupBox):
         if directory:
             self.path_field.setText(directory)
 
+    def set_phase_state(self, phase: str, state: str) -> None:
+        self.phase_state[phase] = state
+        self._render_phase(phase)
+
+    def set_phase_stat(self, phase: str, key: str, text: str) -> None:
+        """Attach one stat (turns / tokens / accuracy) to a phase's label."""
+        self.phase_stats.setdefault(phase, {})[key] = text
+        self._render_phase(phase)
+
+    def _render_phase(self, phase: str) -> None:
+        label = self.phase_status.get(phase)
+        if label is None:
+            return
+        stats = self.phase_stats.get(phase) or {}
+        parts = [self.phase_state.get(phase, "pending")]
+        parts += [stats[key] for key in ("turns", "tokens", "accuracy") if stats.get(key)]
+        label.setText(f"{phase.title()}: " + "  ·  ".join(parts))
+
     def reset_status(self) -> None:
-        for phase, label in self.phase_status.items():
-            label.setText(f"{phase.title()}: pending")
+        self.phase_stats.clear()
+        for phase in self.phase_status:
+            self.set_phase_state(phase, "pending")
 
 
 class SecretDialog(QDialog):
@@ -258,10 +245,14 @@ class RoleEditor(QGroupBox):
         self.depth.setRange(1, 8)
         self.depth.setValue(int(role["depth"]))
 
-        # Per-request sampling -- sent by the router on every call to this
-        # alias (see router/main.py's local-role Backend resolution), not a
-        # launch flag, so changing these takes effect on the next request
-        # with no model restart needed.
+        # Turn budget for the agentic roles. 0 means "not an agentic role"
+        # (one-shot phases have no loop), so the control is only shown where
+        # the number actually means something.
+        self.max_steps = QSpinBox()
+        self.max_steps.setRange(0, 500)
+        self.max_steps.setValue(int(role.get("max_steps") or 0))
+        self.is_agentic = int(role.get("max_steps") or 0) > 0
+
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
         self.temperature.setSingleStep(0.05)
@@ -291,11 +282,6 @@ class RoleEditor(QGroupBox):
         self.repetition_penalty.setDecimals(2)
         self.repetition_penalty.setValue(float(role.get("repetition_penalty", 1.0)))
 
-        # Officially published preset per model+mode (see modeldeck.state.
-        # SAMPLING_PRESETS) -- "Apply preset" snaps the six fields above to
-        # it; it's a starting point, not a lock, so values can still be
-        # hand-tuned afterward. sampling_mode itself is also persisted (see
-        # apply() below) so the choice survives a restart.
         self.sampling_mode = QComboBox()
         self.sampling_mode.addItem("Thinking", "thinking")
         self.sampling_mode.addItem("Thinking (precise coding)", "thinking_precise")
@@ -315,6 +301,9 @@ class RoleEditor(QGroupBox):
         compact.addWidget(self.depth)
         compact.addWidget(QLabel("Reasoning"))
         compact.addWidget(self.reasoning)
+        if self.is_agentic:
+            compact.addWidget(QLabel("Max turns"))
+            compact.addWidget(self.max_steps)
         form.addRow(compact)
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Sampling preset"))
@@ -363,6 +352,8 @@ class RoleEditor(QGroupBox):
         role["context_window"] = self.context.value()
         role["depth"] = self.depth.value()
         role["sampling_mode"] = self.sampling_mode.currentData()
+        if self.is_agentic:
+            role["max_steps"] = self.max_steps.value()
         role["temperature"] = self.temperature.value()
         role["top_p"] = self.top_p.value()
         role["top_k"] = self.top_k.value()
@@ -372,14 +363,6 @@ class RoleEditor(QGroupBox):
 
 
 class PromptCard(QGroupBox):
-    """Editable, per-phase chat-client injection text (see modeldeck.prompts.
-    effective_prompt). save_callback(phase, text) is called on Save and is
-    responsible for persisting to state.json's "prompt_overrides"; reset_
-    callback(phase) restores the built-in default from modeldeck/prompts.py.
-    Editing here has no effect on scripts/*_report.py or renovator_agent.py,
-    which carry their own complete system prompts -- see the banner in
-    MainWindow._build_admin."""
-
     def __init__(
         self,
         phase: str,
@@ -441,10 +424,6 @@ class PromptCard(QGroupBox):
 
 
 class MetricCard(QFrame):
-    """One dashboard tile: a small heading over a big value, used for the
-    live process-parameter grid in the Reports tab (see MainWindow.
-    _build_telemetry / _refresh_flight)."""
-
     def __init__(self, title: str):
         super().__init__()
         self.setObjectName("metricCard")
@@ -473,25 +452,20 @@ class MainWindow(QMainWindow):
         self.report_bridge.finished.connect(self._report_finished)
         self.report_bridge.chunk.connect(self._report_chunk)
         self.report_bridge.ask_question.connect(self._on_ask_question)
-        self.report_start_times: dict[str, float] = {}
-        self.report_processes: dict[str, subprocess.Popen] = {}
-        # phase -> (Event the worker thread blocks on, single-item list the
-        # main-thread dialog handler drops the answer into before setting it)
-        self._pending_answers: dict[str, tuple[threading.Event, list[str]]] = {}
-        self.pipeline_mode: str | None = None
-        self.pipeline_task: str = ""
-        self.pipeline_path: str = ""
-        self.pipeline_queue: list[str] = []
-        self.pipeline_current_phase: str | None = None
-        self.pipeline_renovator_retries: int = 0
-        self._pipeline_resident_role: str | None = None
-        # phase -> last-measured prefill_tok_s from /metrics (populated only
-        # after a request completes) -- carried forward to estimate an ETA
-        # for the *next* request's prefill phase, since mtplx's live /v1/
-        # mtplx/flight endpoint reports prompt_tokens but no live prefill
-        # progress or rate (confirmed empirically: "prefill" stays null
-        # throughout an active prefill, not just before/after it).
-        self._last_prefill_rate: dict[str, float] = {}
+        self.chat_bridge = ChatBridge()
+        self.chat_bridge.chunk.connect(self._chat_chunk)
+        self.chat_bridge.finished.connect(self._chat_finished)
+        self.chat_busy = False
+        self.chat_history: list[dict[str, str]] = []
+
+        # The shared Pipeline orchestrator -- all pipeline logic lives here.
+        # The GUI is a thin adapter that translates Pipeline events into Qt signals.
+        self.pipeline = Pipeline(
+            self.manager,
+            lambda: load_state(),
+            self._pipeline_event_sink,
+        )
+
         self.report_timer = QTimer(self)
         self.report_timer.timeout.connect(self._tick_report_status)
         self.report_timer.start(1000)
@@ -511,6 +485,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_controls(models), "Deck")
+        tabs.addTab(self._build_chat(models), "Chat")
         tabs.addTab(self._build_reports(), "Reports")
         tabs.addTab(self._build_admin(), "Admin")
         self.setCentralWidget(tabs)
@@ -521,6 +496,73 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_metrics)
         self.timer.start(1200)
         self.refresh_metrics()
+
+    # ------------------------------------------------------------------
+    # Pipeline event sink -- translates Pipeline events into Qt signals
+    # ------------------------------------------------------------------
+
+    def _pipeline_event_sink(self, event: dict[str, Any]) -> None:
+        """Receives events from the Pipeline orchestrator and dispatches them
+        to the existing Qt signal handlers (ReportBridge / Bridge)."""
+        etype = event.get("type")
+        phase = event.get("phase", "")
+
+        if etype == "finished":
+            success = event.get("success", False)
+            content = event.get("content", "")
+            tokens = event.get("tokens") or {}
+            if tokens:
+                prompt = int(tokens.get("prompt_tokens") or 0)
+                completion = int(tokens.get("completion_tokens") or 0)
+                self.pipeline_panel.set_phase_stat(
+                    phase, "tokens",
+                    f"{_thousands(completion)} out / {_thousands(prompt)} in",
+                )
+            self.report_bridge.finished.emit(phase, success, content)
+            # After processing finished, let the Pipeline decide what's next
+            result = self.pipeline.on_phase_finished(phase, success, content)
+            # Update button states based on the result
+            panel = self.pipeline_panel
+            status = result.get("status")
+            if status == "complete":
+                panel.full_suite_button.setEnabled(True)
+                panel.step_wise_button.setEnabled(True)
+                panel.continue_button.setEnabled(False)
+                self.statusBar().showMessage("Pipeline complete", 5000)
+            elif status == "step_paused":
+                panel.continue_button.setEnabled(True)
+            elif status == "failed":
+                panel.full_suite_button.setEnabled(True)
+                panel.step_wise_button.setEnabled(True)
+                panel.continue_button.setEnabled(False)
+            # If run_next was called internally (full mode), buttons stay disabled
+
+        elif etype == "chunk":
+            piece = event.get("content", "")
+            self.report_bridge.chunk.emit(phase, piece)
+
+        elif etype == "ask_question":
+            payload = event.get("payload", "")
+            self.report_bridge.ask_question.emit(phase, payload)
+
+        elif etype == "phase_status":
+            self.pipeline_panel.set_phase_state(phase, event.get("status", ""))
+
+        elif etype == "turns":
+            limit = int(event.get("limit") or 0)
+            used = int(event.get("used") or 0)
+            self.pipeline_panel.set_phase_stat(
+                phase, "turns", f"turn {used}/{limit}" if limit else f"turn {used}",
+            )
+
+        elif etype == "notification":
+            message = event.get("message", "")
+            self.pipeline_panel.output.appendPlainText(f"\n{message}\n")
+            self.statusBar().showMessage(message, 6000)
+
+    # ------------------------------------------------------------------
+    # Deck tab
+    # ------------------------------------------------------------------
 
     def _build_controls(self, models: list[dict[str, Any]]) -> QWidget:
         scroll = QScrollArea()
@@ -586,14 +628,6 @@ class MainWindow(QMainWindow):
         kind_index = self.planner_kind.findData(str(self.state["planner"].get("kind", "openai")))
         if kind_index >= 0:
             self.planner_kind.setCurrentIndex(kind_index)
-        self.planner_local_phase = QComboBox()
-        for phase in ("scout", "builder", "renovator", "auditor"):
-            self.planner_local_phase.addItem(phase.title(), phase)
-        phase_index = self.planner_local_phase.findData(
-            str(self.state["planner"].get("local_phase", "builder"))
-        )
-        if phase_index >= 0:
-            self.planner_local_phase.setCurrentIndex(phase_index)
         self.planner_model = QLineEdit(str(self.state["planner"]["model"]))
         self.planner_effort = QComboBox()
         self.planner_effort.addItems(
@@ -611,45 +645,52 @@ class MainWindow(QMainWindow):
         key_row.addWidget(key_button)
         planner_form.addRow("Backend", self.planner_kind)
         planner_form.addRow(
-            "Local role (fallback -- no API credits needed)", self.planner_local_phase
+            QLabel(
+                "Local uses the Planner role below (its own model/port), not\n"
+                "another phase's -- cloud fields here apply only to Cloud (OpenAI)."
+            )
         )
-        planner_form.addRow("Model", self.planner_model)
-        planner_form.addRow("Reasoning", self.planner_effort)
+        planner_form.addRow("Cloud model", self.planner_model)
+        planner_form.addRow("Cloud reasoning", self.planner_effort)
         planner_form.addRow(key_row)
         layout.addWidget(planner_box)
         self.planner_kind.currentIndexChanged.connect(self._update_planner_backend_visibility)
         self._update_planner_backend_visibility()
 
         self.editors: dict[str, RoleEditor] = {}
-        for phase in ("scout", "builder", "renovator", "auditor"):
+        for phase in ("scout", "planner", "builder", "renovator", "auditor"):
             editor = RoleEditor(phase.title(), models, self.state["roles"][phase])
             layout.addWidget(editor)
             self.editors[phase] = editor
 
+        button_row = QHBoxLayout()
+        shutdown_button = QPushButton("Shut models down")
+        shutdown_button.setObjectName("stopButton")
+        shutdown_button.setToolTip(
+            "Stop every resident local model and free its RAM. Does not touch "
+            "the router or a running pipeline phase."
+        )
+        shutdown_button.clicked.connect(self.shutdown_models)
         save_button = QPushButton("Save configuration")
         save_button.clicked.connect(self.save_configuration)
-        layout.addWidget(save_button, alignment=Qt.AlignmentFlag.AlignRight)
+        button_row.addWidget(shutdown_button)
+        button_row.addStretch()
+        button_row.addWidget(save_button)
+        layout.addLayout(button_row)
         layout.addStretch()
 
         scroll.setWidget(body)
         return scroll
 
+    # ------------------------------------------------------------------
+    # Telemetry (bottom of Reports tab)
+    # ------------------------------------------------------------------
+
     def _build_telemetry(self) -> QWidget:
-        """Live telemetry -- lives at the bottom of the Reports tab (not the
-        Deck tab) since that's where it's actually watched: while a pipeline
-        phase is running, not while adjusting role config."""
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Live process-parameter dashboard -- from /v1/mtplx/flight, which
-        # (unlike /metrics) updates *during* a request, not only after it
-        # finishes. This is the actual answer to "is it stuck or just
-        # thinking": which model, current phase (prefill vs decode), live
-        # tok/s, token counts, elapsed time, and MTP depth acceptance, all
-        # in the same card layout the old (post-hoc, /metrics-fed) grid
-        # used -- just wired to a source that's actually live during a run
-        # instead of frozen until the request finishes.
         live_box = QGroupBox("Current request")
         live_box_layout = QVBoxLayout(live_box)
         self.live_status = QLabel("Idle -- no request in flight")
@@ -703,6 +744,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(advanced)
 
         return body
+
+    # ------------------------------------------------------------------
+    # Admin tab
+    # ------------------------------------------------------------------
 
     def _build_admin(self) -> QWidget:
         scroll = QScrollArea()
@@ -790,6 +835,168 @@ class MainWindow(QMainWindow):
         entry = PROMPTS.get(phase)
         return entry[1] if entry else ""
 
+    # ------------------------------------------------------------------
+    # Reports tab
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Chat tab -- draft the prompt before the pipeline ever sees it
+    # ------------------------------------------------------------------
+
+    def _build_chat(self, models: list[dict[str, Any]]) -> QWidget:
+        """A plain conversation with a model of its own, for working a vague
+        idea into a prompt worth spending a full pipeline run on. Separate
+        model selector on purpose: the qualities that make a good drafting
+        partner here have nothing to do with the tool-loop tuning the
+        pipeline roles carry, and switching one must not perturb the other.
+        The payoff button is "Send to pipeline", which drops the drafted
+        text straight into the Deck tab's task field."""
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(22, 18, 22, 22)
+
+        heading = QLabel("Prompt workshop")
+        heading.setObjectName("title")
+        layout.addWidget(heading)
+        blurb = QLabel(
+            "Talk the task through here first. When the wording is right, "
+            "send it to the Deck tab's task field and run the suite."
+        )
+        blurb.setWordWrap(True)
+        layout.addWidget(blurb)
+
+        role = self.state["roles"]["chat"]
+        picker = QHBoxLayout()
+        picker.addWidget(QLabel("Model"))
+        self.chat_model = QComboBox()
+        names = [str(item.get("name") or item.get("id") or "") for item in models]
+        for name in names:
+            if name:
+                self.chat_model.addItem(name, name)
+        current = str(role["model"])
+        if self.chat_model.findData(current) < 0:
+            self.chat_model.addItem(current, current)
+        self.chat_model.setCurrentIndex(self.chat_model.findData(current))
+        picker.addWidget(self.chat_model, 1)
+        self.chat_load_button = QPushButton("Load model")
+        self.chat_load_button.setObjectName("launchButton")
+        self.chat_load_button.setToolTip(
+            "Make this the resident local model (stops the others first, "
+            "same single-model discipline as the pipeline phases)."
+        )
+        self.chat_load_button.clicked.connect(self._load_chat_model)
+        picker.addWidget(self.chat_load_button)
+        layout.addLayout(picker)
+
+        self.chat_transcript = QPlainTextEdit()
+        self.chat_transcript.setReadOnly(True)
+        self.chat_transcript.setPlaceholderText(
+            "Load the chat model, then start describing what you want built."
+        )
+        mono_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        mono_font.setPointSize(11)
+        self.chat_transcript.setFont(mono_font)
+        self.chat_transcript.setMinimumHeight(360)
+        layout.addWidget(self.chat_transcript, 1)
+
+        self.chat_input = QPlainTextEdit()
+        self.chat_input.setPlaceholderText("Your message…")
+        self.chat_input.setMaximumHeight(120)
+        layout.addWidget(self.chat_input)
+
+        row = QHBoxLayout()
+        self.chat_send_button = QPushButton("Send")
+        self.chat_send_button.setObjectName("launchButton")
+        self.chat_send_button.clicked.connect(self._chat_send)
+        row.addWidget(self.chat_send_button)
+        clear_button = QPushButton("Clear conversation")
+        clear_button.clicked.connect(self._chat_clear)
+        row.addWidget(clear_button)
+        row.addStretch(1)
+        to_pipeline = QPushButton("Send to pipeline →")
+        to_pipeline.setToolTip(
+            "Copy the drafted prompt into the Deck tab's task field. Uses "
+            "your selection if you've highlighted part of the transcript, "
+            "otherwise the model's most recent reply."
+        )
+        to_pipeline.clicked.connect(self._chat_to_pipeline)
+        row.addWidget(to_pipeline)
+        layout.addLayout(row)
+        return body
+
+    def _load_chat_model(self) -> None:
+        self.state["roles"]["chat"]["model"] = str(self.chat_model.currentData())
+        save_state(self.state)
+        self.activate("chat")
+
+    def _chat_send(self) -> None:
+        if self.chat_busy:
+            return
+        message = self.chat_input.toPlainText().strip()
+        if not message:
+            return
+        self.chat_input.clear()
+        self.chat_history.append({"role": "user", "content": message})
+        self.chat_transcript.appendPlainText(f"\n\n### you\n{message}\n\n### model\n")
+        self.chat_busy = True
+        self.chat_send_button.setEnabled(False)
+        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + list(self.chat_history)
+
+        def work() -> None:
+            try:
+                text = stream_chat(
+                    "chat", messages,
+                    on_chunk=lambda piece: self.chat_bridge.chunk.emit(piece),
+                    router_url=self._router_base() + "/v1",
+                    timeout=900.0,
+                )
+            except Exception as exc:
+                self.chat_bridge.finished.emit(False, str(exc))
+                return
+            self.chat_bridge.finished.emit(True, text)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _chat_chunk(self, piece: str) -> None:
+        cursor = self.chat_transcript.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.chat_transcript.setTextCursor(cursor)
+        self.chat_transcript.insertPlainText(piece)
+        self.chat_transcript.ensureCursorVisible()
+
+    def _chat_finished(self, success: bool, text: str) -> None:
+        self.chat_busy = False
+        self.chat_send_button.setEnabled(True)
+        if not success:
+            self.chat_transcript.appendPlainText(f"\n[failed: {text}]\n")
+            self.statusBar().showMessage("Chat request failed", 5000)
+            return
+        self.chat_history.append({"role": "assistant", "content": text})
+
+    def _chat_clear(self) -> None:
+        self.chat_history.clear()
+        self.chat_transcript.clear()
+
+    def _chat_to_pipeline(self) -> None:
+        selected = self.chat_transcript.textCursor().selectedText().replace("\u2029", "\n")
+        draft = selected.strip()
+        if not draft:
+            for entry in reversed(self.chat_history):
+                if entry["role"] == "assistant":
+                    draft = entry["content"].strip()
+                    break
+        if not draft:
+            QMessageBox.information(
+                self, "Nothing to send",
+                "Draft a prompt here first, or select the part of the "
+                "transcript you want to use.",
+            )
+            return
+        self.pipeline_panel.task_field.setPlainText(draft)
+        self.statusBar().showMessage(
+            "Prompt copied into the Deck tab's task field", 5000
+        )
+
     def _build_reports(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -834,246 +1041,64 @@ class MainWindow(QMainWindow):
         scroll.setWidget(body)
         return scroll
 
-    def _activate_for_report(self, phase: str) -> None:
-        """Point Deck's telemetry panel at whichever backend this phase is
-        about to use. The pipeline calls model aliases (scout/planner/
-        builder/auditor) directly and never goes through activate_local/
-        activate_planner otherwise, so without this the telemetry panel
-        silently keeps polling whatever was last clicked in the Deck tab --
-        not what's actually running. This only moves the state pointer, not
-        process lifecycle: no launch/stop of any model here."""
-        state = load_state()
-        if phase == "planner":
-            activate_planner(state)
-        else:
-            activate_local(state, phase)
-        save_state(state)
-        self.state = state
-        self.refresh_metrics()
-
-    def _phase_local_role(self, phase: str) -> str | None:
-        """Which local role needs to be resident for this phase, or None
-        when it's the cloud planner (nothing local to launch)."""
-        if phase == "planner":
-            if self.state["planner"].get("kind") == "local":
-                return str(self.state["planner"].get("local_phase") or "builder")
-            return None
-        return phase
-
-    def _ensure_role_resident(self, role_name: str | None) -> None:
-        """Swaps the resident local model only if the phase about to run
-        needs a different one than what's already loaded -- consecutive
-        phases that share a role (Planner-via-Builder followed by the real
-        Builder phase) don't pay a pointless stop/relaunch cycle. Runs on
-        the background worker thread: launch() blocks waiting for model
-        warmup, so this must never be called from the UI thread."""
-        if role_name is None:
-            return
-        if self._pipeline_resident_role == role_name:
-            return
-        state = load_state()
-        ports = [int(r["port"]) for r in state["roles"].values()]
-        self.manager.stop_local_models(ports)
-        self.manager.launch(role_name, state["roles"][role_name])
-        self._pipeline_resident_role = role_name
+    # ------------------------------------------------------------------
+    # Pipeline control (thin adapters over self.pipeline)
+    # ------------------------------------------------------------------
 
     def _start_pipeline(self, mode: str) -> None:
         path = self.pipeline_panel.path_field.text().strip()
         task = self.pipeline_panel.task_field.toPlainText().strip()
         start_phase = str(self.pipeline_panel.start_phase.currentData())
-        if not path:
-            QMessageBox.information(self, "Path required", "Enter a file or directory to scan.")
+
+        result = self.pipeline.start(mode, path, task, start_phase)
+        if "error" in result:
+            QMessageBox.information(self, "Pipeline", result["error"])
             return
-        if start_phase == "scout" and not task:
-            QMessageBox.information(self, "Task required", "Describe what this change/investigation is for.")
-            return
-
-        required = REQUIRED_ARTIFACT_FOR_START.get(start_phase, "")
-        if required:
-            required_path = resolve_ai_path(Path(path), required)
-            if not required_path.exists():
-                QMessageBox.warning(
-                    self, "Missing prerequisite",
-                    f"Starting at {start_phase.title()} needs {required_path} to already exist "
-                    f"(normally written by an earlier phase). Run from Scout instead, or point "
-                    f"Path at a location where that file is already present.",
-                )
-                return
-
-        self.pipeline_mode = mode
-        self.pipeline_task = task
-        self.pipeline_path = path
-        start_index = PIPELINE_ORDER.index(start_phase)
-        self.pipeline_queue = list(PIPELINE_ORDER[start_index:])
-        self.pipeline_renovator_retries = 0
-        self._pipeline_resident_role = None
-        self.pipeline_panel.reset_status()
-        for skipped_phase in PIPELINE_ORDER[:start_index]:
-            self.pipeline_panel.phase_status[skipped_phase].setText(f"{skipped_phase.title()}: skipped (resumed)")
-        self.pipeline_panel.output.clear()
-        self.pipeline_panel.full_suite_button.setEnabled(False)
-        self.pipeline_panel.step_wise_button.setEnabled(False)
-        self.pipeline_panel.continue_button.setEnabled(False)
-        self._run_next_pipeline_phase()
-
-    def _run_next_pipeline_phase(self) -> None:
-        if not self.pipeline_queue:
-            self.pipeline_panel.full_suite_button.setEnabled(True)
-            self.pipeline_panel.step_wise_button.setEnabled(True)
-            self.statusBar().showMessage("Pipeline complete", 5000)
-            return
-
-        phase = self.pipeline_queue.pop(0)
-        self.pipeline_current_phase = phase
-        self._activate_for_report(phase)
 
         panel = self.pipeline_panel
-        panel.phase_status[phase].setText(f"{phase.title()}: preparing model…")
+        panel.reset_status()
+        panel.output.clear()
+        panel.full_suite_button.setEnabled(False)
+        panel.step_wise_button.setEnabled(False)
+        panel.continue_button.setEnabled(False)
         panel.stop_button.setEnabled(True)
-        panel.output.appendPlainText(f"\n=== {phase.upper()} ===\n")
-        self.report_start_times[phase] = time.monotonic()
-        threading.Thread(
-            target=self._pipeline_worker,
-            args=(phase, self.pipeline_task, self.pipeline_path),
-            daemon=True,
-        ).start()
+        panel.output.appendPlainText(f"\n=== {start_phase.upper()} ===\n")
 
     def _on_pipeline_continue_clicked(self) -> None:
         self.pipeline_panel.continue_button.setEnabled(False)
-        self._run_next_pipeline_phase()
+        self.pipeline_panel.stop_button.setEnabled(True)
+        result = self.pipeline.run_next()
+        if result.get("status") == "complete":
+            self.pipeline_panel.full_suite_button.setEnabled(True)
+            self.pipeline_panel.step_wise_button.setEnabled(True)
+            self.statusBar().showMessage("Pipeline complete", 5000)
 
     def _on_pipeline_stop_clicked(self) -> None:
-        phase = getattr(self, "pipeline_current_phase", None)
-        process = self.report_processes.get(phase) if phase else None
-        if process is None or process.poll() is not None:
-            return
-        self.pipeline_queue.clear()  # a manual stop should not auto-continue
-        self.pipeline_panel.phase_status[phase].setText(f"{phase.title()}: stopping…")
+        self.pipeline.stop()
         self.pipeline_panel.stop_button.setEnabled(False)
-        process.terminate()
-        # If the worker thread is blocked in _handle_ask_question waiting on
-        # an answer (not on reading stdout), terminate() alone would never
-        # unblock it -- release it here with an empty answer so it can
-        # notice the dead process and finish instead of hanging forever.
-        event, box = self._pending_answers.pop(phase, (None, None))
-        if box is not None:
-            box.append("")
-        if event is not None:
-            event.set()
-        # No further bookkeeping needed here: the worker thread's read loop
-        # sees stdout close, process.wait() returns a nonzero code, and
-        # _pipeline_worker's existing failure path (report_bridge.finished
-        # with success=False) already handles that -- same UI update as any
-        # other failed run.
 
     def _tick_report_status(self) -> None:
-        """Ticks every second regardless of whether any text has streamed
-        yet. Prefill (the model processing the input context before it
-        produces a single output token) has no progress signal in the
-        streaming API -- not from mtplx, not from any chat client, not from
-        anything -- so for a large-context single-shot call there can be a long,
-        genuinely silent stretch before the output pane shows anything.
-        This at least confirms the run hasn't died, rather than showing
-        nothing at all."""
         now = time.monotonic()
         panel = getattr(self, "pipeline_panel", None)
         if panel is None:
             return
-        for phase, start in self.report_start_times.items():
-            label = panel.phase_status.get(phase)
-            if label is not None:
-                label.setText(f"{phase.title()}: running… {now - start:.0f}s")
+        for phase, start in list(self.pipeline.report_start_times.items()):
+            if phase in panel.phase_status:
+                panel.set_phase_state(phase, f"running… {now - start:.0f}s")
 
-    def _pipeline_worker(self, phase: str, task: str, path: str) -> None:
-        try:
-            self._ensure_role_resident(self._phase_local_role(phase))
-        except Exception as exc:
-            self.report_bridge.finished.emit(phase, False, f"Could not prepare the model for {phase}: {exc}")
-            return
+    # ------------------------------------------------------------------
+    # Report event handlers (Qt thread)
+    # ------------------------------------------------------------------
 
-        config = REPORT_SCRIPTS[phase]
-        python = PROJECT_DIR / ".venv" / "bin" / "python"
-        script_path = PROJECT_DIR / "scripts" / config["script"]
-        args = [str(a) for a in config["build_args"](task, path)]
-        try:
-            process = subprocess.Popen(
-                [str(python), str(script_path), *args],
-                cwd=PROJECT_DIR,
-                stdin=subprocess.PIPE,  # builder_agent.py's ask_question blocks reading a line here
-                stdout=subprocess.PIPE,
-                # Combined into stdout so we only have one pipe to drain --
-                # the script's progress lines and the model's streamed text
-                # arrive interleaved in the order they were printed, which is
-                # exactly the transcript we want to show live.
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except Exception as exc:
-            self.report_bridge.finished.emit(phase, False, str(exc))
-            return
-
-        self.report_processes[phase] = process
-        collected: list[str] = []
-        assert process.stdout is not None
-        line_buffer = ""
-        while True:
-            piece = process.stdout.read(64)
-            if not piece:
-                break
-            collected.append(piece)
-            self.report_bridge.chunk.emit(phase, piece)
-            line_buffer += piece
-            while "\n" in line_buffer:
-                line, line_buffer = line_buffer.split("\n", 1)
-                if line.startswith("[ASK_QUESTION] "):
-                    self._handle_ask_question(phase, process, line[len("[ASK_QUESTION] "):])
-        returncode = process.wait()
-        output_text = "".join(collected)
-
-        if returncode != 0:
-            prefix = "Stopped by user.\n\n" if returncode < 0 else ""
-            self.report_bridge.finished.emit(
-                phase, False, prefix + (output_text.strip() or f"exit code {returncode}")
-            )
-            return
-        out_path = self._parse_wrote_path(output_text)
-        if out_path is None:
-            self.report_bridge.finished.emit(
-                phase, False, f"Script exited 0 but its output path wasn't found in:\n{output_text}"
-            )
-            return
-        try:
-            content = out_path.read_text()
-        except OSError as exc:
-            self.report_bridge.finished.emit(
-                phase, False, f"Script succeeded but {out_path} could not be read: {exc}"
-            )
-            return
-        self.report_bridge.finished.emit(phase, True, content)
-
-    def _handle_ask_question(self, phase: str, process: subprocess.Popen, payload: str) -> None:
-        """Runs on the pipeline worker thread. Hands the question to the UI
-        thread via a signal (PySide6 queues cross-thread signals onto the
-        receiving QObject's own thread automatically) and blocks this
-        thread -- not the UI -- until _on_ask_question sets the event after
-        the person answers the dialog."""
-        answer_event = threading.Event()
-        answer_box: list[str] = []
-        self._pending_answers[phase] = (answer_event, answer_box)
-        self.report_bridge.ask_question.emit(phase, payload)
-        answer_event.wait()
-        answer = answer_box[0] if answer_box else ""
-        assert process.stdin is not None
-        try:
-            process.stdin.write(answer + "\n")
-            process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass  # process already gone (e.g. stopped while waiting) -- nothing to feed the answer to
+    def _report_chunk(self, phase: str, piece: str) -> None:
+        panel = self.pipeline_panel
+        cursor = panel.output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        panel.output.setTextCursor(cursor)
+        panel.output.insertPlainText(piece)
+        panel.output.ensureCursorVisible()
 
     def _on_ask_question(self, phase: str, payload: str) -> None:
-        """Runs on the UI thread. Shows a blocking dialog, then unblocks
-        _handle_ask_question's wait on the pipeline worker thread."""
         try:
             data = json.loads(payload)
         except ValueError:
@@ -1099,38 +1124,14 @@ class MainWindow(QMainWindow):
             answer = text if ok else ""
         panel.output.appendPlainText(f"--- answered: {answer} ---\n")
 
-        event, box = self._pending_answers.pop(phase, (None, None))
-        if box is not None:
-            box.append(answer)
-        if event is not None:
-            event.set()
-
-    def _report_chunk(self, phase: str, piece: str) -> None:
-        panel = self.pipeline_panel
-        cursor = panel.output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        panel.output.setTextCursor(cursor)
-        panel.output.insertPlainText(piece)
-        panel.output.ensureCursorVisible()
-
-    @staticmethod
-    def _parse_wrote_path(stdout: str) -> Path | None:
-        """Each script prints "Wrote <path>" on success. Parsing that instead
-        of reconstructing the path ourselves keeps the GUI in sync with
-        wherever the script actually anchored the artifact (the target
-        project, not this tool's own directory -- see resolve_ai_path)."""
-        for line in stdout.splitlines():
-            if line.startswith("Wrote "):
-                raw = Path(line[len("Wrote "):].strip())
-                return raw if raw.is_absolute() else PROJECT_DIR / raw
-        return None
+        # Unblock the pipeline worker thread via the Pipeline's answer method
+        self.pipeline.answer(phase, answer)
 
     def _report_finished(self, phase: str, success: bool, text: str) -> None:
         panel = self.pipeline_panel
-        self.report_processes.pop(phase, None)
-        start = self.report_start_times.pop(phase, None)
+        start = self.pipeline.report_start_times.pop(phase, None)
         elapsed = f" ({time.monotonic() - start:.0f}s)" if start is not None else ""
-        panel.phase_status[phase].setText(f"{phase.title()}: {'done' if success else 'failed'}{elapsed}")
+        panel.set_phase_state(phase, f"{'done' if success else 'failed'}{elapsed}")
         panel.output.appendPlainText(
             f"\n\n--- {phase.upper()} {'FINISHED' if success else 'FAILED'} ---\n"
             + (text if success else f"Failed:\n\n{text}")
@@ -1142,35 +1143,24 @@ class MainWindow(QMainWindow):
         )
 
         if not success:
-            self.pipeline_queue.clear()
-            panel.full_suite_button.setEnabled(True)
-            panel.step_wise_button.setEnabled(True)
-            panel.continue_button.setEnabled(False)
             QMessageBox.warning(self, f"{phase.title()} failed", text[:2000])
             return
 
         if phase == "auditor":
+            # The auditor scores how much of the plan the builder actually
+            # landed. It hangs off the *builder's* label, not the auditor's,
+            # because it is a measurement of the builder's configuration --
+            # the whole point of asking for it (see auditor_report.py).
+            accuracy = parse_builder_accuracy(text)
+            if accuracy is not None:
+                panel.set_phase_stat("builder", "accuracy", f"{accuracy}% accurate")
             verdict = parse_verdict(text)
             if verdict != "PASS":
-                if self.pipeline_renovator_retries < MAX_RENOVATOR_RETRIES:
-                    self.pipeline_renovator_retries += 1
-                    self.pipeline_queue = ["renovator", "auditor"]
-                    note = (
-                        f"Auditor verdict: {verdict}. Queuing one repair pass "
-                        f"(Renovator, retry {self.pipeline_renovator_retries}/"
-                        f"{MAX_RENOVATOR_RETRIES}) against its Fix List, then "
-                        "re-auditing."
-                    )
-                    panel.output.appendPlainText(f"\n{note}\n")
-                    self.statusBar().showMessage(note, 6000)
-                    # Falls through to the normal full/step advance logic below
-                    # -- pipeline_queue now has entries either way, so it
-                    # behaves exactly like any other multi-phase continuation.
+                # The Pipeline's on_phase_finished already handled the queue logic.
+                # Here we just show the user-facing dialog.
+                if self.pipeline.pipeline_renovator_retries > 0:
+                    pass  # renovator was queued by on_phase_finished
                 else:
-                    self.pipeline_queue.clear()
-                    panel.full_suite_button.setEnabled(True)
-                    panel.step_wise_button.setEnabled(True)
-                    panel.continue_button.setEnabled(False)
                     QMessageBox.warning(
                         self, "Auditor rejected again",
                         f"Auditor's verdict is still {verdict} after a repair pass. "
@@ -1179,27 +1169,24 @@ class MainWindow(QMainWindow):
                     )
                     return
 
-        if self.pipeline_mode == "full":
-            self._run_next_pipeline_phase()
-            return
+        if self.pipeline.pipeline_mode == "full":
+            return  # on_phase_finished already called run_next
 
-        if self.pipeline_queue:
-            panel.continue_button.setEnabled(True)
+        if self.pipeline.pipeline_queue:
             QMessageBox.information(
                 self, f"{phase.title()} complete",
                 f"{phase.title()} finished successfully{elapsed}. Review its output, "
-                f"then click Continue to run {self.pipeline_queue[0].title()} next.",
+                f"then click Continue to run {self.pipeline.pipeline_queue[0].title()} next.",
             )
-        else:
-            panel.full_suite_button.setEnabled(True)
-            panel.step_wise_button.setEnabled(True)
-            self.statusBar().showMessage("Pipeline complete", 5000)
+
+    # ------------------------------------------------------------------
+    # Configuration / activation
+    # ------------------------------------------------------------------
 
     def save_configuration(self) -> None:
         for phase, editor in self.editors.items():
             editor.apply(self.state["roles"][phase])
         self.state["planner"]["kind"] = str(self.planner_kind.currentData())
-        self.state["planner"]["local_phase"] = str(self.planner_local_phase.currentData())
         self.state["planner"]["model"] = self.planner_model.text().strip()
         self.state["planner"]["reasoning_effort"] = self.planner_effort.currentText()
         save_state(self.state)
@@ -1207,9 +1194,25 @@ class MainWindow(QMainWindow):
 
     def _update_planner_backend_visibility(self) -> None:
         is_local = self.planner_kind.currentData() == "local"
-        self.planner_local_phase.setEnabled(is_local)
         self.planner_model.setEnabled(not is_local)
         self.planner_effort.setEnabled(not is_local)
+
+    def shutdown_models(self) -> None:
+        """Stop every resident local model. Runs off the UI thread because
+        stop_local_models waits for each port to actually free."""
+        state = load_state()
+        ports = [int(r["port"]) for r in state["roles"].values()]
+
+        def work() -> None:
+            try:
+                self.manager.stop_local_models(ports)
+            except Exception as exc:
+                self.bridge.failed.emit("shutdown", str(exc))
+                return
+            self.bridge.succeeded.emit("shutdown", "All local models stopped")
+
+        self.statusBar().showMessage("Stopping local models…")
+        threading.Thread(target=work, daemon=True).start()
 
     def set_api_key(self) -> None:
         dialog = SecretDialog(self)
@@ -1251,7 +1254,9 @@ class MainWindow(QMainWindow):
                     activate_planner(snapshot)
                     detail = str(snapshot["planner"]["model"])
                 else:
-                    local_phase = snapshot["planner"]["local_phase"] if planner_is_local else phase
+                    # Planner has its own role now; a local planner launches
+                    # roles["planner"] rather than borrowing another phase's.
+                    local_phase = phase
                     role = snapshot["roles"][local_phase]
                     self.manager.launch(local_phase, role)
                     if planner_is_local:
@@ -1270,12 +1275,20 @@ class MainWindow(QMainWindow):
         self.state = load_state()
         self.busy = False
         self._set_buttons_enabled(True)
+        if phase == "shutdown":
+            self.statusBar().showMessage(detail, 5000)
+            self.refresh_metrics()
+            return
         self.statusBar().showMessage(f"{phase.title()} active · {detail}")
         self.refresh_metrics()
 
     def _phase_failed(self, phase: str, message: str) -> None:
         self.busy = False
         self._set_buttons_enabled(True)
+        if phase == "shutdown":
+            self.statusBar().showMessage("Shutdown failed", 5000)
+            QMessageBox.critical(self, "Shutdown failed", message)
+            return
         self.statusBar().showMessage(f"Could not activate {phase}")
         QMessageBox.critical(self, "Phase switch failed", message)
 
@@ -1283,6 +1296,13 @@ class MainWindow(QMainWindow):
         self.launch_button.setEnabled(enabled)
         for button in self.phase_buttons.values():
             button.setEnabled(enabled)
+        chat_load = getattr(self, "chat_load_button", None)
+        if chat_load is not None:
+            chat_load.setEnabled(enabled)
+
+    # ------------------------------------------------------------------
+    # Metrics / telemetry
+    # ------------------------------------------------------------------
 
     def _router_base(self) -> str:
         router = self.state["router"]
@@ -1353,10 +1373,7 @@ class MainWindow(QMainWindow):
             return
         latest = envelope.get("latest") or {}
         if latest.get("prefill_tok_s"):
-            # Carried forward so a later request's live prefill phase (which
-            # itself reports no rate -- see _refresh_flight) has something
-            # to estimate an ETA from.
-            self._last_prefill_rate[phase] = float(latest["prefill_tok_s"])
+            self.pipeline._last_prefill_rate[phase] = float(latest["prefill_tok_s"])
         self._refresh_flight(base, phase, health)
 
         used = int(latest.get("context_len") or 0)
@@ -1402,10 +1419,6 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _model_label(health: dict[str, Any]) -> str:
-        """A short, readable model name for the dashboard's Model card --
-        health's own "model" field is just the router alias (e.g. "scout"),
-        not which actual weights are loaded, so pull the repo name out of
-        model_path instead."""
         alias = str(health.get("model") or "—")
         path = str(health.get("model_path") or "")
         repo = path.rsplit("/", 1)[-1] if path else ""
@@ -1419,12 +1432,6 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _live_prefill_rate(base: str) -> tuple[float, int] | None:
-        """(tokens/sec, tokens_done) for the current prefill chunk, from
-        /v1/mtplx/metrics/stream's in_flight[].prefill_state -- see
-        _refresh_flight's docstring. Returns None if there's no in-flight
-        request, or if it hasn't finished its first chunk yet (tokens_done
-        still 0), in which case the caller falls back to the historical
-        estimate."""
         try:
             snapshot = fetch_sse_snapshot(f"{base}/v1/mtplx/metrics/stream?snapshot_interval_ms=50", timeout=0.3)
         except Exception:
@@ -1440,29 +1447,7 @@ class MainWindow(QMainWindow):
         return tokens_done / float(elapsed), tokens_done
 
     def _refresh_flight(self, base: str, role_phase: str, health: dict[str, Any]) -> None:
-        """Live process-parameter dashboard from mtplx's own flight log --
-        this is what actually updates during prefill/decode, unlike
-        /metrics (whose "latest" stays null until a request finishes). Best
-        effort: an older mtplx build without this endpoint just shows Idle,
-        same as no request being in flight. Model card always reflects
-        health (genuinely live server state) even when idle -- everything
-        else needs an in-flight request to mean anything.
-
-        During an active prefill, /v1/mtplx/flight's own numbers are no help
-        for a rate or ETA: "prefill" is null and tps_now/tps_avg are both 0
-        for the whole phase (confirmed empirically, not documented). The
-        real live per-chunk progress (tokens_done/tokens_total/elapsed_s)
-        only exists on /v1/mtplx/metrics/stream's in_flight[].prefill_state
-        -- confirmed against mtplx's own app, which reads this same field
-        for its live "prefill tps / ETA" gauge. That's an SSE endpoint, but
-        each event is a full snapshot (not a delta), so one connect-read-
-        close per refresh tick works fine -- no persistent connection
-        needed. Only queried while phase == "prefill", to avoid the extra
-        request on every tick. If tokens_done is still 0 (prefill hasn't
-        finished its first chunk yet, e.g. a short prompt that completes
-        within one 2048-token chunk before this ever gets called), falls
-        back to the same last-completed-request estimate as before."""
-        known_rate = self._last_prefill_rate.get(role_phase)
+        known_rate = self.pipeline._last_prefill_rate.get(role_phase)
         prefill_rate_text = f"{known_rate:.0f} tok/s" if known_rate else "—"
 
         self.live_cards["model"].value.setText(self._model_label(health))

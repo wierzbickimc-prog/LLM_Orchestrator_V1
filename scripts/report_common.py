@@ -256,6 +256,33 @@ def parse_verdict(report_text: str) -> str:
     return "UNKNOWN"
 
 
+def parse_builder_accuracy(report_text: str) -> int | None:
+    """Reads the auditor's optional "BUILDER_ACCURACY: <0-100>" line -- its
+    estimate of what fraction of the plan the builder actually implemented
+    correctly, judged against the code and the real test results. Returns
+    None when absent or unparseable.
+
+    This is a model's judgement, not a measurement, so it is only meaningful
+    compared against itself: the point is to make different builder settings
+    (model, reasoning mode, turn budget) comparable across benchmark runs,
+    not to assert an objective score. Treat a single number as noise; treat
+    a consistent gap between two configurations as signal."""
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.upper().startswith("BUILDER_ACCURACY:"):
+            digits = "".join(ch for ch in stripped.split(":", 1)[1] if ch.isdigit())
+            if not digits:
+                return None
+            value = int(digits)
+            return value if 0 <= value <= 100 else None
+        if stripped.upper().startswith("VERDICT:"):
+            continue
+        break
+    return None
+
+
 def read_required_artifact(path: Path, produced_by: str) -> str:
     try:
         return path.read_text()

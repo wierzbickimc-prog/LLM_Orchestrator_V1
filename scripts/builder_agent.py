@@ -89,11 +89,27 @@ you will be asked to retry -- avoid that by splitting large writes up front \
 rather than after it happens.
 
 Send only one tool call per response, then wait for its result before the \
-next one. When you have implemented the plan and verified it (tests pass), \
-reply with plain text and no ```tool block: a summary of what you did, files \
-changed, verification commands run and their results, and any discrepancies \
-from the plan. That plain-text reply ends the session, so do not send it \
-until you are actually done.
+next one.
+
+Before you finish, you must actually RUN the tests with run_command and see \
+them pass. Not read them, not reason about whether they would pass -- run \
+them and look at the output. If the project has no obvious test command, \
+run whatever does exercise the change (an import, a script, a build) and \
+say in your report what you ran and what it proved. Tests you wrote but \
+never executed are the single most common way a run like this fails: they \
+are written against the code you *intended*, and the mismatches are exactly \
+the ones you cannot see by re-reading your own work. When a test fails, fix \
+it and run again -- a failing suite is not something to hand off with an \
+explanation attached.
+
+When the plan is implemented and you have seen the tests pass, reply with \
+plain text and no ```tool block: a summary of what you did, files changed, \
+the verification commands you ran with their actual output, and any \
+discrepancies from the plan. If you are ending without a green test run, \
+say so in the first line of that report and state exactly what is failing \
+-- do not describe the work as verified, complete, or passing when you have \
+not watched it pass. That plain-text reply ends the session, so do not send \
+it until you are actually done.
 
 The complete implementation plan is already included below in full -- do \
 not spend a turn reading it again from .ai/implementation-plan.md, you \

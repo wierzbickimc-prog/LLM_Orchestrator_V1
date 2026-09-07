@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from ipaddress import IPv4Address, IPv4Network
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from modeldeck.mtplx import RUN_DIR
+from modeldeck.mtplx import ProcessManager, RUN_DIR
+from modeldeck.pipeline import Pipeline
 from modeldeck.prompts import effective_prompt
 from modeldeck.secrets import get_openai_api_key
 from modeldeck.state import load_state
 
-from . import loop_guard
+from . import loop_guard, web
 from .settings import Backend, load_settings
 
 # How much of each message's content to keep verbatim in the capture file
@@ -23,6 +26,74 @@ _CAPTURE_CONTENT_PREVIEW_CHARS = 4000
 
 settings = load_settings()
 app = FastAPI(title="Model Deck Router", version="0.1.0")
+
+# ---------------------------------------------------------------------------
+# Tailscale source-IP allowlist middleware
+# ---------------------------------------------------------------------------
+
+# Tailscale CGNAT range (100.64.0.0/10) is always allowed for non-loopback.
+_TAILSCALE_CGNAT = IPv4Network("100.64.0.0/10")
+
+
+def _load_allowed_cidrs() -> list[IPv4Network]:
+    """Parse the TAILSCALE_CIDRS env var (comma-separated CIDRs)."""
+    raw = os.getenv("TAILSCALE_CIDRS", "").strip()
+    if not raw:
+        return []
+    networks = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            networks.append(IPv4Network(part, strict=False))
+        except ValueError:
+            pass
+    return networks
+
+
+def _is_allowed_source(host: str | None) -> bool:
+    """Loopback is always allowed. Otherwise the source must be within the
+    Tailscale CGNAT range or an operator-configured TAILSCALE_CIDRS entry."""
+    if host is None:
+        return False
+    # Always allow loopback
+    if host in ("127.0.0.1", "::1"):
+        return True
+    try:
+        addr = IPv4Address(host)
+    except ValueError:
+        # IPv6 or unparseable -- reject (conservative)
+        return False
+    if addr in _TAILSCALE_CGNAT:
+        return True
+    for network in _load_allowed_cidrs():
+        if addr in network:
+            return True
+    return False
+
+
+@app.middleware("http")
+async def allowlist_middleware(request: Request, call_next):
+    client_host = request.client.host if request.client else None
+    if not _is_allowed_source(client_host):
+        return JSONResponse(status_code=403, content={"detail": "Access denied: not from Tailnet"})
+    response = await call_next(request)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Shared Pipeline instance (used by both the web router and available to GUI)
+# ---------------------------------------------------------------------------
+
+_manager = ProcessManager()
+_pipeline = Pipeline(_manager, lambda: load_state(), web._make_event_sink())
+web.init(_pipeline, _manager)
+
+
+# Mount the web API router
+app.include_router(web.router, tags=["web"])
+
 
 
 def backend_for_model(model: str) -> Backend:
@@ -49,20 +120,26 @@ def backend_for_model(model: str) -> Backend:
             base_url=str(active["base_url"]).rstrip("/"),
             model_id=str(active["model_id"]),
         )
-    # "planner" and "auditor" are directly addressable regardless of Model
-    # Deck's currently-active GUI phase -- same as scout/builder already are
-    # below -- so a standalone script (scripts/*_report.py) can always reach
-    # the right backend without depending on, or changing, global GUI state.
     if model == "planner":
         state = load_state()
         planner_cfg = state["planner"]
         if planner_cfg.get("kind") == "local":
-            local_phase = str(planner_cfg.get("local_phase") or "builder")
-            role = state["roles"][local_phase]
+            # Planner has its own role now (its own model/port/sampling),
+            # rather than borrowing another phase's via "local_phase".
+            role = state["roles"]["planner"]
+            reasoning = str(role.get("reasoning") or "auto")
             return Backend(
                 alias="planner",
                 base_url=f"http://127.0.0.1:{int(role['port'])}/v1",
-                model_id=local_phase,
+                model_id="planner",
+                reasoning=reasoning,
+                enable_thinking=(reasoning != "off"),
+                temperature=role.get("temperature"),
+                top_p=role.get("top_p"),
+                top_k=role.get("top_k"),
+                min_p=role.get("min_p"),
+                presence_penalty=role.get("presence_penalty"),
+                repetition_penalty=role.get("repetition_penalty"),
             )
         api_key = get_openai_api_key()
         if not api_key:
@@ -78,13 +155,7 @@ def backend_for_model(model: str) -> Backend:
             reasoning_effort=str(planner_cfg.get("reasoning_effort") or "high"),
             provider="openai",
         )
-    if model in {"scout", "builder", "auditor", "renovator"}:
-        # Read live from state.json (same source the GUI's RoleEditor saves
-        # to and ProcessManager.launch() reads from) rather than the
-        # env-var-based Settings.scout/builder loaded once at router
-        # startup -- that older path meant editing Scout/Builder's model,
-        # reasoning, or sampling parameters in the GUI and saving had no
-        # effect on what a request to that alias actually carried.
+    if model in {"scout", "builder", "auditor", "renovator", "chat"}:
         role = load_state()["roles"][model]
         reasoning = str(role.get("reasoning") or "auto")
         return Backend(
@@ -143,6 +214,7 @@ def prepare_payload(payload: dict[str, Any], backend: Backend) -> dict[str, Any]
     return upstream_payload
 
 
+
 def _preview_content(content: Any) -> tuple[Any, int | None]:
     if not isinstance(content, str):
         return content, None
@@ -153,9 +225,6 @@ def _preview_content(content: Any) -> tuple[Any, int | None]:
 
 
 def capture_incoming_request(payload: dict[str, Any], phase: str) -> None:
-    """Dump exactly what the calling chat client sent (before our own injection touches it) to
-    .run/last-request.json, so a real request can be inspected instead of
-    guessed at from mtplx's text-preview log lines."""
     try:
         messages = payload.get("messages") or []
         captured_messages = []
@@ -188,20 +257,10 @@ def capture_incoming_request(payload: dict[str, Any], phase: str) -> None:
 
 
 def wants_injection_skipped(request: Request) -> bool:
-    """A caller with its own complete, non-agentic system prompt (no tools,
-    no chat-client/editor assumptions -- e.g. scripts/scout_report.py) can
-    send this header to skip the chat-client-oriented phase reinforcement,
-    which would otherwise talk about a "native editor tool" that doesn't
-    exist for it."""
     return request.headers.get("x-modeldeck-skip-injection", "").lower() in ("1", "true")
 
 
 def inject_phase_instructions(payload: dict[str, Any], phase: str) -> dict[str, Any]:
-    """Splice this phase's requirements onto whatever system message the
-    chat client already sent, so they hold for every turn of the task
-    rather than only the pasted-in first message. Appends rather than
-    replaces, since that system message carries the client's own tool
-    definitions."""
     text = effective_prompt(phase, load_state())
     if text is None:
         return payload
@@ -222,7 +281,7 @@ def _feed_guard_from_sse_line(guard: Any, line: str) -> None:
     line = line.strip("\r")
     if not line.startswith("data: "):
         return
-    data = line[len("data: ") :]
+    data = line[len("data: "):]
     if data == "[DONE]":
         return
     try:
@@ -244,13 +303,14 @@ def upstream_error(backend: Backend, exc: httpx.RequestError) -> HTTPException:
     )
 
 
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     workflow = load_state()
     return {
         "status": "ok",
         "active": workflow["active"],
-        "models": ["local", settings.scout.alias, settings.builder.alias, "planner", "auditor", "renovator"],
+        "models": ["local", settings.scout.alias, settings.builder.alias, "planner", "auditor", "renovator", "chat"],
     }
 
 
@@ -265,6 +325,7 @@ async def models() -> dict[str, Any]:
             {"id": "planner", "object": "model", "owned_by": "model-deck"},
             {"id": "auditor", "object": "model", "owned_by": "local"},
             {"id": "renovator", "object": "model", "owned_by": "local"},
+            {"id": "chat", "object": "model", "owned_by": "local"},
         ],
     }
 

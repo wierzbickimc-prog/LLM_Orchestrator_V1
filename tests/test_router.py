@@ -79,7 +79,6 @@ class RoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = default_state()
             state["planner"]["kind"] = "local"
-            state["planner"]["local_phase"] = "builder"
             save_state(state, Path(directory) / "state.json")
             with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
                 # No API key needed, and no api_key patch supplied -- if this
@@ -87,8 +86,8 @@ class RoutingTests(unittest.TestCase):
                 backend = backend_for_model("planner")
         self.assertEqual(backend.provider, "local")
         self.assertIsNone(backend.api_key)
-        self.assertEqual(backend.model_id, "builder")
-        self.assertEqual(backend.base_url, "http://127.0.0.1:8002/v1")
+        self.assertEqual(backend.model_id, "planner")
+        self.assertEqual(backend.base_url, "http://127.0.0.1:8008/v1")
 
     def test_auditor_alias_is_directly_addressable_regardless_of_active_phase(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -197,3 +196,17 @@ class InjectionSkipHeaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatAliasTests(unittest.TestCase):
+    def test_chat_alias_is_its_own_role_on_its_own_port(self) -> None:
+        # The Chat tab must not borrow a pipeline role: loading a drafting
+        # model has to be possible without perturbing the tuned phases.
+        with tempfile.TemporaryDirectory() as directory:
+            state = activate_local(default_state(), "scout")
+            save_state(state, Path(directory) / "state.json")
+            with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
+                backend = backend_for_model("chat")
+        self.assertEqual(backend.model_id, "chat")
+        self.assertEqual(backend.base_url, "http://127.0.0.1:8010/v1")
+        self.assertEqual(backend.provider, "local")

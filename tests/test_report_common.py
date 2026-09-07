@@ -12,6 +12,7 @@ from report_common import (  # noqa: E402
     collect_files,
     describe_skipped,
     looks_like_failed_tool_call,
+    parse_builder_accuracy,
     parse_verdict,
     referenced_files,
     resolve_ai_path,
@@ -178,3 +179,27 @@ class ParseVerdictTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuilderAccuracyTests(unittest.TestCase):
+    def test_reads_the_score_from_the_line_after_the_verdict(self) -> None:
+        report = "VERDICT: REJECT\nBUILDER_ACCURACY: 62\n\n## Findings\n..."
+        self.assertEqual(parse_builder_accuracy(report), 62)
+
+    def test_absent_line_is_none_rather_than_a_made_up_zero(self) -> None:
+        # Older reports predate the line entirely; a zero here would read as
+        # "the builder produced nothing", which is a very different claim.
+        self.assertIsNone(parse_builder_accuracy("VERDICT: PASS\n\n## Findings\n"))
+
+    def test_out_of_range_and_unparseable_values_are_rejected(self) -> None:
+        self.assertIsNone(parse_builder_accuracy("VERDICT: PASS\nBUILDER_ACCURACY: 140\n"))
+        self.assertIsNone(parse_builder_accuracy("VERDICT: PASS\nBUILDER_ACCURACY: high\n"))
+
+    def test_stops_looking_once_the_report_body_starts(self) -> None:
+        # A "BUILDER_ACCURACY:" mentioned in prose partway down the report is
+        # the model discussing the field, not reporting a score.
+        report = "VERDICT: PASS\n\n## Findings\nThe BUILDER_ACCURACY: 99 line was missing.\n"
+        self.assertIsNone(parse_builder_accuracy(report))
+
+    def test_percent_sign_and_extra_spacing_are_tolerated(self) -> None:
+        self.assertEqual(parse_builder_accuracy("VERDICT: PASS\nBUILDER_ACCURACY:  85%\n"), 85)

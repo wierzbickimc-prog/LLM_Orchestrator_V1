@@ -90,18 +90,16 @@ def default_state() -> dict[str, Any]:
             "model_id": "scout",
         },
         "planner": {
-            # "kind": "local" reuses one of the local roles below (via
-            # local_phase) instead of the cloud GPT backend -- a fallback
-            # for when the OpenAI account has no credits, or you'd rather
-            # not spend them on planning.
-            # Points at "renovator" (the dense model), not "builder", since
-            # Builder moved to the MoE: planning is the step with the least
-            # downstream error correction in this pipeline (Builder
-            # implements the plan faithfully and Auditor checks compliance
-            # *with* the plan, so nobody questions the plan's premises),
-            # which makes it the worst place to economize on capability.
+            # "kind": "local" runs the planner on its own role below
+            # (roles["planner"], its own model/port/sampling), rather than
+            # borrowing another phase's role as it used to via
+            # "local_phase". Planning is the step with the least downstream
+            # error correction in this pipeline -- Builder implements the
+            # plan faithfully and Auditor checks compliance *with* the plan,
+            # so nothing downstream questions its premises -- which makes it
+            # the worst place to economize, and the one most worth being
+            # able to tune independently of any other phase.
             "kind": "openai",
-            "local_phase": "renovator",
             "model": "gpt-5.6-sol",
             "base_url": "https://api.openai.com/v1",
             "reasoning_effort": "high",
@@ -178,7 +176,7 @@ def default_state() -> dict[str, Any]:
             # docs/IMPROVEMENTS_TODO.md for the outcome either way.
             "builder": _role(
                 DEFAULT_SCOUT, 8002, "auto", "medium", 131_072, 3,
-                sampling_mode="thinking_precise",
+                sampling_mode="thinking_precise", max_steps=80,
             ),
             # Renovator gets its own role rather than reusing Builder's, so
             # the two can run different models. Deliberately left on
@@ -188,9 +186,15 @@ def default_state() -> dict[str, Any]:
             # question worth its own benchmark -- reasoning tokens in a
             # tool-call loop are exactly the kind of interaction that has
             # bitten this project before, so don't change both at once.
+            # max_steps=80, matching Builder: 40 was not enough. A repair
+            # pass hit the cap on a four-item fix list and reported
+            # "stopped after 40 steps without the model signaling
+            # completion" -- a repair is not intrinsically cheaper than the
+            # original build, because it starts by re-reading files it did
+            # not write in this session.
             "renovator": _role(
                 DEFAULT_BUILDER, 8006, "off", "auto", 131_072, 3,
-                sampling_mode="instruct",
+                sampling_mode="instruct", max_steps=80,
             ),
             # Auditor's actual job is breadth (scan the whole tree for
             # out-of-scope changes), not narrow depth on a few files -- that's
@@ -205,6 +209,31 @@ def default_state() -> dict[str, Any]:
             "auditor": _role(
                 DEFAULT_SCOUT, 8004, "auto", "medium", 131_072, 3,
                 sampling_mode="thinking_precise",
+            ),
+            # Planner's own role (port 8008), no longer borrowing another
+            # phase's. Deliberately identical in model/reasoning/sampling to
+            # what it inherited from "renovator" before this split, so the
+            # change is purely structural with no behavioral delta to
+            # confound a benchmark. Worth noting for a *separate*
+            # experiment: reasoning="off" is arguably a mismatch for a pure
+            # design step (it was inherited from a tool-loop role, where off
+            # is right), and now that this is its own role that's a one-
+            # dropdown change in the Deck tab instead of a config surgery.
+            "planner": _role(
+                DEFAULT_BUILDER, 8008, "off", "auto", 131_072, 3,
+                sampling_mode="instruct",
+            ),
+            # Not a pipeline phase: this backs the Chat tab, where a prompt
+            # gets talked through and sharpened *before* it is handed to
+            # Scout. Its own role and its own port because the whole value of
+            # the tab is being able to think out loud against a fast,
+            # conversational model without disturbing whatever the pipeline
+            # roles are currently tuned to. reasoning="auto" + thinking
+            # because drafting a spec is reasoning work, not tool work --
+            # the opposite of the tool-loop roles above.
+            "chat": _role(
+                DEFAULT_SCOUT, 8010, "auto", "medium", 131_072, 3,
+                sampling_mode="thinking",
             ),
         },
         "router": {"host": "127.0.0.1", "port": 8100},
@@ -229,11 +258,20 @@ def _role(
     kv_quantization: str = "q8",
     preserve_thinking: str = "auto",
     sampling_mode: str = "thinking",
+    max_steps: int = 0,
 ) -> dict[str, Any]:
     sampling = sampling_preset(model, sampling_mode) or dict(_GENERIC_SAMPLING_FALLBACK)
     return {
         "model": model,
         "port": port,
+        # How many tool-loop turns this role gets before the safety cap
+        # stops it. 0 means "not an agentic role" (scout/planner/auditor are
+        # one-shot calls with no loop, so the number is meaningless there).
+        # Surfaced in the Deck tab because running out of turns is a real,
+        # observed failure mode that looks like a quality problem but isn't:
+        # a Renovator pass hit its 40-turn cap mid-repair and reported
+        # "stopped after 40 steps without the model signaling completion".
+        "max_steps": max_steps,
         "context_window": context_window,
         "kv_quantization": kv_quantization,
         "depth": depth,
@@ -323,13 +361,13 @@ def activate_local(state: dict[str, Any], phase: str) -> dict[str, Any]:
 def activate_planner(state: dict[str, Any]) -> dict[str, Any]:
     planner = state["planner"]
     if planner.get("kind") == "local":
-        local_phase = str(planner.get("local_phase") or "builder")
-        role = state["roles"][local_phase]
+        # Planner runs on its own role/port now, not on another phase's.
+        role = state["roles"]["planner"]
         state["active"] = {
             "phase": "planner",
             "kind": "local",
             "base_url": f"http://127.0.0.1:{int(role['port'])}/v1",
-            "model_id": local_phase,
+            "model_id": "planner",
         }
         return state
     state["active"] = {

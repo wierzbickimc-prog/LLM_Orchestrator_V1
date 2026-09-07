@@ -37,15 +37,31 @@ class StateTests(unittest.TestCase):
         self.assertEqual(state["active"]["kind"], "openai")
         self.assertEqual(state["active"]["model_id"], "gpt-5.6-sol")
 
-    def test_planner_activation_can_fall_back_to_a_local_role(self) -> None:
+    def test_planner_activation_uses_the_planners_own_role_when_local(self) -> None:
+        # Not another phase's role: the planner has its own model, port and
+        # sampling, so it can be tuned without dragging a tool-loop phase
+        # along with it.
         state = default_state()
         state["planner"]["kind"] = "local"
-        state["planner"]["local_phase"] = "auditor"
         activate_planner(state)
         self.assertEqual(state["active"]["phase"], "planner")
         self.assertEqual(state["active"]["kind"], "local")
-        self.assertEqual(state["active"]["model_id"], "auditor")
-        self.assertEqual(state["active"]["base_url"], "http://127.0.0.1:8004/v1")
+        self.assertEqual(state["active"]["model_id"], "planner")
+        self.assertEqual(state["active"]["base_url"], "http://127.0.0.1:8008/v1")
+
+    def test_agentic_roles_carry_a_turn_budget_and_one_shot_roles_do_not(self) -> None:
+        # max_steps is what the pipeline passes as --max-steps, and 0 is the
+        # sentinel for "this role has no tool loop at all".
+        roles = default_state()["roles"]
+        self.assertGreater(roles["builder"]["max_steps"], 0)
+        self.assertGreater(roles["renovator"]["max_steps"], 0)
+        for phase in ("scout", "planner", "auditor", "chat"):
+            self.assertEqual(roles[phase]["max_steps"], 0, phase)
+
+    def test_every_role_has_a_distinct_port(self) -> None:
+        # Two roles on one port silently means "launching B killed A".
+        ports = [role["port"] for role in default_state()["roles"].values()]
+        self.assertEqual(len(ports), len(set(ports)))
 
 
 class CommandTests(unittest.TestCase):

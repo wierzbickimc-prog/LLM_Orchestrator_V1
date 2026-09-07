@@ -101,6 +101,20 @@ untested and materially risky change) -- not for every stylistic nit. Minor \
 residual gaps that don't rise to that bar belong in the findings below, not \
 in the verdict.
 
+The second line must then be exactly:
+BUILDER_ACCURACY: <integer 0-100>
+This is your estimate of what percentage of the implementation plan the \
+builder actually implemented correctly -- judged against the code you can \
+see and, when a test execution block is present below, against what \
+actually ran. 100 means every requirement landed and works; 0 means \
+nothing usable was produced. Weight requirements by substance, not count \
+(a missing core behavior costs far more than a missing docstring), and \
+judge only what the *builder* was responsible for, not gaps that the plan \
+itself left ambiguous. This number is used to compare builder \
+configurations across benchmark runs, so be consistent and avoid rounding \
+everything to reassuring numbers -- an honest 40 is far more useful than a \
+polite 85.
+
 If a "Test suite execution" block appears below, it is REAL output from \
 actually running the tests just now -- not something to infer from reading \
 test source. Treat it as ground truth over your own read of the test code: \
