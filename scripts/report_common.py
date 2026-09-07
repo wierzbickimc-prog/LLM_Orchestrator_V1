@@ -17,10 +17,20 @@ from typing import Callable
 
 DEFAULT_ROUTER_URL = "http://127.0.0.1:8100/v1"
 
-# Enough headroom under the 100k context window for the model's own report
-# generation, after the task + file contents + system prompt. ~260k chars is
-# roughly 65-70k tokens for code-heavy text, leaving 30k+ for the response.
-DEFAULT_CHAR_BUDGET = 260_000
+# Sized against the 131,072-token context window the roles actually run
+# (modeldeck/state.py), keeping the same proportional headroom the old
+# 260k-char number reserved under the 100k window it was written for: ~360k
+# chars is roughly 90-97k tokens of code-heavy text, leaving 30-40k for the
+# system prompt and the model's own report. This was NOT updated when the
+# window went 100k -> 128k, so for a while every phase was leaving a third
+# of its context unused while silently dropping files over the old budget.
+#
+# Raising this is not free: a bigger context costs prefill time on every
+# request whether or not it's filled, and Scout is already the slowest
+# phase. Don't raise it further without a measured reason -- the fix for
+# "the tree doesn't fit" is usually excluding what doesn't belong in the
+# scan (see IGNORED_DIRS), not buying more room.
+DEFAULT_CHAR_BUDGET = 360_000
 
 IGNORED_DIRS = {
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
@@ -35,6 +45,15 @@ IGNORED_DIRS = {
     # not source either; see docs/IMPROVEMENTS_TODO.md for why an agent
     # should never write_file into project.pbxproj directly.
     ".build", ".swiftpm",
+    # This project's own scratch area for test projects (an unrelated
+    # thermocycler app, etc.). Scanning the orchestrator repo used to pull
+    # ~250k chars of it into every context, which at the old budget meant
+    # everything sorting after "sandbox/" -- the whole of scripts/ and
+    # tests/ -- was dropped. Note this is matched RELATIVE TO THE SCAN ROOT
+    # (see collect_files), so pointing a phase directly at
+    # sandbox/SomeProject still scans it normally; it is only ignored when
+    # it sits *inside* the tree being scanned.
+    "sandbox",
 }
 
 XCODE_BUNDLE_SUFFIXES = (".xcodeproj", ".xcworkspace")
@@ -85,20 +104,59 @@ def resolve_ai_path(target: Path, filename: str) -> Path:
 
 
 def collect_files(root: Path, extensions: set[str]) -> list[Path]:
+    """Source files under root, ignoring IGNORED_DIRS, ordered so that a
+    context-budget shortfall degrades evenly (see _interleave_by_area).
+
+    Ignore matching is relative to root, not against the whole path: a
+    target's own location must not disqualify it. Scanning
+    sandbox/Thermocycler_Program_REV1 directly has to work even though
+    "sandbox" is an ignored directory name, and the same applies to anyone
+    whose checkout happens to live under a directory called "build" or
+    "dist"."""
     if root.is_file():
         return [root]
     files = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        if any(part in IGNORED_DIRS for part in path.parts):
+        relative_parts = path.relative_to(root).parts
+        if any(part in IGNORED_DIRS for part in relative_parts):
             continue
-        if any(part.endswith(XCODE_BUNDLE_SUFFIXES) for part in path.parts):
+        if any(part.endswith(XCODE_BUNDLE_SUFFIXES) for part in relative_parts):
             continue
         if path.suffix not in extensions:
             continue
         files.append(path)
-    return files
+    return _interleave_by_area(files, root)
+
+
+def _interleave_by_area(files: list[Path], root: Path) -> list[Path]:
+    """Round-robin the files across their top-level directories, keeping
+    each area's own files in alphabetical order.
+
+    build_context fills its budget in list order and drops the remainder, so
+    a plain alphabetical sort turns a budget shortfall into an amputation:
+    on this repo it cut off inside "scripts/", and every file in scripts/
+    and tests/ vanished from every Scout context -- meaning Scout had never
+    read the code that actually runs the pipeline. Interleaving doesn't
+    create room, but it changes *how* a shortfall lands: instead of one
+    area disappearing completely, every area loses its tail. A report built
+    from a thin slice of everything is recoverable; one built with no
+    knowledge that scripts/ exists is not, because nothing downstream can
+    tell the difference."""
+    areas: dict[str, list[Path]] = {}
+    for path in files:
+        relative = path.relative_to(root).parts
+        area = relative[0] if len(relative) > 1 else ""
+        areas.setdefault(area, []).append(path)
+    ordered: list[Path] = []
+    queues = list(areas.values())
+    while queues:
+        for queue in list(queues):
+            ordered.append(queue.pop(0))
+            if not queue:
+                queues.remove(queue)
+    return ordered
 
 
 _PATH_LIKE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z]{1,10}")

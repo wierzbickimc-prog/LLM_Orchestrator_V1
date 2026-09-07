@@ -203,3 +203,66 @@ class BuilderAccuracyTests(unittest.TestCase):
 
     def test_percent_sign_and_extra_spacing_are_tolerated(self) -> None:
         self.assertEqual(parse_builder_accuracy("VERDICT: PASS\nBUILDER_ACCURACY:  85%\n"), 85)
+
+
+class IgnoreScopeTests(unittest.TestCase):
+    def test_ignored_dir_names_are_matched_relative_to_the_scan_root(self) -> None:
+        # Pointing a phase directly at a project that happens to live inside
+        # an ignored directory has to work: sandbox/SomeProject is scanned
+        # regularly, and "sandbox" is an ignored name. The target's own
+        # location must never disqualify the target.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sandbox" / "MyProject"
+            (root / "src").mkdir(parents=True)
+            (root / "src" / "main.py").write_text("x = 1\n")
+            found = collect_files(root, {".py"})
+        self.assertEqual([p.name for p in found], ["main.py"])
+
+    def test_ignored_dir_inside_the_tree_is_still_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "keep.py").write_text("x = 1\n")
+            (root / "sandbox").mkdir()
+            (root / "sandbox" / "other.py").write_text("y = 2\n")
+            found = collect_files(root, {".py"})
+        self.assertEqual([p.name for p in found], ["keep.py"])
+
+
+class InterleaveByAreaTests(unittest.TestCase):
+    def _tree(self, root: Path) -> None:
+        for area, names in {
+            "aaa": ["one.py", "two.py", "three.py"],
+            "zzz": ["alpha.py", "beta.py"],
+        }.items():
+            (root / area).mkdir()
+            for name in names:
+                (root / area / name).write_text("x\n")
+
+    def test_every_area_appears_before_any_area_repeats(self) -> None:
+        # The point of the ordering: build_context fills its budget in list
+        # order, so whatever sorts last is what gets dropped. Alphabetical
+        # order made that an amputation of whole directories -- this repo
+        # lost all of scripts/ and tests/ from every Scout context, and
+        # nothing downstream could tell that had happened.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._tree(root)
+            areas = [p.parent.name for p in collect_files(root, {".py"})]
+        self.assertEqual(areas[:2], ["aaa", "zzz"])
+        self.assertEqual(areas, ["aaa", "zzz", "aaa", "zzz", "aaa"])
+
+    def test_an_exhausted_area_drops_out_without_stalling_the_others(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._tree(root)
+            found = collect_files(root, {".py"})
+        self.assertEqual(len(found), 5)
+        self.assertEqual(found[-1].parent.name, "aaa")
+
+    def test_files_keep_alphabetical_order_within_their_own_area(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._tree(root)
+            found = collect_files(root, {".py"})
+        aaa = [p.name for p in found if p.parent.name == "aaa"]
+        self.assertEqual(aaa, sorted(aaa))

@@ -111,6 +111,32 @@ the way it is.
 
 ## Done
 
+- **Scout was reading roughly half the tree, and the missing half was
+  always the same half.** `build_context` fills its char budget in list
+  order and drops the remainder; `collect_files` returned plain
+  alphabetical order, so a shortfall amputated whole directories rather
+  than trimming evenly. Measured on this repo: 60 files found, 27
+  included, 33 dropped -- the cutoff landed inside `scripts/`, so every
+  file in `scripts/` and `tests/` was absent from every Scout context ever
+  built. Scout had never read the code that actually runs the pipeline.
+  Three fixes: (1) `sandbox/` is ignored when it sits inside the scanned
+  tree (it was eating ~250k chars, 20% of the budget, on an unrelated
+  thermocycler project) while still being scannable when targeted
+  directly -- ignore names are now matched relative to the scan root, not
+  anywhere in the path, which was a latent bug for any checkout living
+  under a directory named `build`/`dist`; (2) `DEFAULT_CHAR_BUDGET` 260k
+  -> 360k, since the old number was sized for the 100k context window and
+  was never updated when roles moved to 131,072 -- a third of the window
+  was going unused while files were being dropped over the old budget;
+  (3) `collect_files` now round-robins across top-level directories, so a
+  future shortfall costs every area its tail instead of erasing one area.
+  Result on this repo: 40 files found, 39 included, 1 skipped
+  (`scripts/stack.sh`). Worth remembering that `describe_skipped` was
+  already telling the model which files it couldn't see -- that is the
+  only reason this degraded quality quietly instead of producing obvious
+  hallucinations about missing files.
+
+
 - **Reports tab: replaced the "Last completed request" telemetry box (fed
   by `/metrics`, which only updates once a request finishes -- frozen for
   the entire duration of whatever's actually running) with genuinely live
