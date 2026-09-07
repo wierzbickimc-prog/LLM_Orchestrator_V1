@@ -9,6 +9,21 @@ the way it is.
 
 ## Open
 
+- **The router process doesn't restart when the GUI does, and nothing
+  flags that it's running stale code.** Hit live: added a new "renovator"
+  router alias, restarted the GUI (which relaunches models but not the
+  router itself -- it's a separate long-lived process, `router.main`,
+  started once by `ProcessManager.ensure_router()` and left running
+  across GUI restarts unless explicitly killed), and got a 404 "Unknown
+  model alias: renovator" for a script that had been working seconds
+  earlier in a different context. The router had been running since the
+  previous day, entirely unaware any code had changed. Worth either: (a)
+  a version/build marker in `/health` the GUI can compare against the
+  code on disk and warn about, or (b) just always restarting the router
+  alongside the GUI (matching the model relaunch behavior) rather than
+  treating it as a separate lifecycle. Low cost either way, and this class
+  of "silently stale long-lived process" bug is easy to lose an hour to.
+
 - **Chunk Builder's work per plan-step instead of one long accumulating
   session.** Right now `builder_agent.py` runs the *entire* plan as one
   conversation: every file read, every write_file/tool result, stays in

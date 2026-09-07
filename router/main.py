@@ -250,7 +250,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "active": workflow["active"],
-        "models": ["local", settings.scout.alias, settings.builder.alias, "planner", "auditor"],
+        "models": ["local", settings.scout.alias, settings.builder.alias, "planner", "auditor", "renovator"],
     }
 
 
@@ -264,6 +264,7 @@ async def models() -> dict[str, Any]:
             {"id": settings.builder.alias, "object": "model", "owned_by": "local"},
             {"id": "planner", "object": "model", "owned_by": "model-deck"},
             {"id": "auditor", "object": "model", "owned_by": "local"},
+            {"id": "renovator", "object": "model", "owned_by": "local"},
         ],
     }
 
