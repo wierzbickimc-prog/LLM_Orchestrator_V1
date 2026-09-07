@@ -94,8 +94,14 @@ def default_state() -> dict[str, Any]:
             # local_phase) instead of the cloud GPT backend -- a fallback
             # for when the OpenAI account has no credits, or you'd rather
             # not spend them on planning.
+            # Points at "renovator" (the dense model), not "builder", since
+            # Builder moved to the MoE: planning is the step with the least
+            # downstream error correction in this pipeline (Builder
+            # implements the plan faithfully and Auditor checks compliance
+            # *with* the plan, so nobody questions the plan's premises),
+            # which makes it the worst place to economize on capability.
             "kind": "openai",
-            "local_phase": "builder",
+            "local_phase": "renovator",
             "model": "gpt-5.6-sol",
             "base_url": "https://api.openai.com/v1",
             "reasoning_effort": "high",
@@ -126,12 +132,47 @@ def default_state() -> dict[str, Any]:
             # "thinking"/"thinking_precise" pair with reasoning="auto"/"on".
             # Toggle per-role in the GUI (Deck tab -> role editor -> Apply
             # preset) if a task calls for a different mode than the default.
+            # context_window 131_072 (128K): was ~100K, raised after a live
+            # Builder run hit 95K/104K prompt tokens by step 25 on a
+            # multi-file task (several full-file reads plus their own large
+            # write_file bodies accumulate fast). Confirmed real RAM
+            # headroom (64G box, ~20G resident for weights+context) before
+            # raising. Deliberately not raised further than this: a bigger
+            # window costs more prefill time per request regardless of
+            # whether it's filled, so this is a real speed/room tradeoff,
+            # not a free upgrade -- 128K covers the observed case with
+            # headroom without chasing an unbounded ceiling.
             "scout": _role(
-                DEFAULT_SCOUT, 8000, "auto", "medium", 100_000, 3,
+                DEFAULT_SCOUT, 8000, "auto", "medium", 131_072, 3,
                 sampling_mode="thinking",
             ),
+            # Builder on the MoE (~3B active params/token): the bulk of a
+            # build is mechanical volume -- read a file, write it back,
+            # run the tests -- and Builder's errors are among the cheapest
+            # in the pipeline to catch, since Auditor reads the whole tree
+            # afterward and a REJECT costs one Renovator pass, not a
+            # rebuild. Paired with the dense model on Renovator below: fast
+            # bulk pass, expert cleanup. UNVALIDATED as of this change --
+            # every tool-call pathology seen so far (missing/stripped
+            # ```tool fences) was on the dense model's "tokenizer" chat
+            # template, and we have no evidence either way about how the
+            # MoE's "local_qwen36" template behaves in a long tool-use
+            # loop, because scout/auditor never emit tool calls. Benchmark
+            # before trusting it -- see docs/IMPROVEMENTS_TODO.md.
             "builder": _role(
-                DEFAULT_BUILDER, 8002, "off", "auto", 100_000, 3,
+                DEFAULT_SCOUT, 8002, "off", "auto", 131_072, 3,
+                sampling_mode="instruct",
+            ),
+            # Renovator gets its own role rather than reusing Builder's, so
+            # the two can run different models. Deliberately left on
+            # reasoning="off" + instruct, matching Builder's proven
+            # tool-loop config: the point of this split is to test the
+            # *model* variable on its own. Thinking mode here is a separate
+            # question worth its own benchmark -- reasoning tokens in a
+            # tool-call loop are exactly the kind of interaction that has
+            # bitten this project before, so don't change both at once.
+            "renovator": _role(
+                DEFAULT_BUILDER, 8006, "off", "auto", 131_072, 3,
                 sampling_mode="instruct",
             ),
             # Auditor's actual job is breadth (scan the whole tree for
@@ -145,7 +186,7 @@ def default_state() -> dict[str, Any]:
             # review, which is exactly what Qwen3.6's coding-tuned thinking
             # preset is for, as opposed to scout's more general investigation.
             "auditor": _role(
-                DEFAULT_SCOUT, 8004, "auto", "medium", 100_000, 3,
+                DEFAULT_SCOUT, 8004, "auto", "medium", 131_072, 3,
                 sampling_mode="thinking_precise",
             ),
         },

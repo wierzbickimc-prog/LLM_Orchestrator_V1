@@ -78,7 +78,7 @@ def backend_for_model(model: str) -> Backend:
             reasoning_effort=str(planner_cfg.get("reasoning_effort") or "high"),
             provider="openai",
         )
-    if model in {"scout", "builder", "auditor"}:
+    if model in {"scout", "builder", "auditor", "renovator"}:
         # Read live from state.json (same source the GUI's RoleEditor saves
         # to and ProcessManager.launch() reads from) rather than the
         # env-var-based Settings.scout/builder loaded once at router

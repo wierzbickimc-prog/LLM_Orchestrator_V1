@@ -23,7 +23,14 @@ from pathlib import Path
 from builder_agent import DEFAULT_COMMAND_TIMEOUT, run_agent
 from report_common import DEFAULT_ROUTER_URL, ReportError, read_required_artifact, resolve_ai_path
 
-DEFAULT_MAX_STEPS = 20  # a repair pass is scoped to a handful of defects, not a whole plan
+DEFAULT_MAX_STEPS = 40
+# Was 20 ("a repair pass is scoped to a handful of defects, not a whole
+# plan") -- too tight in a live run where Auditor's Fix List had 5
+# substantial items across 3 files plus 2 test files, close to a full
+# implementation's worth of work. Ran out and hit the generic step-cap
+# message rather than a genuine self-reported stop. Kept below Builder's
+# 80 to preserve the intended scope difference (a fix list, not a full
+# plan), but 20 had no real margin for read+write+verify per item.
 
 SCOPE_PREAMBLE = """The implementation below was already built and already audited. The audit \
 REJECTED it for the specific defects listed under "Audit findings (your scope)" below \
@@ -81,6 +88,7 @@ def main() -> int:
             args.path, scoped_plan, "", args.max_steps, args.command_timeout,
             args.router_url, args.timeout, args.dry_run,
             on_chunk=lambda piece: print(piece, end="", flush=True),
+            model_alias="renovator",
         )
     except ReportError as exc:
         print(str(exc), file=sys.stderr)

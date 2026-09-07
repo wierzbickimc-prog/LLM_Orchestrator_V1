@@ -26,6 +26,7 @@ TOOL_BLOCK_RE = re.compile(r"```tool\s*\n(.*?)```", re.DOTALL)
 # "the model is done" -- ending the session after zero real work with this
 # stray text saved as the final report.
 _BARE_TOOL_JSON_RE = re.compile(r'\{\s*"name"\s*:')
+_OPEN_FENCE_RE = re.compile(r"```tool\s*\n")
 
 # Long command output eats context fast (e.g. a verbose test run) without
 # adding much signal past a point -- keep enough to see the failure, drop
@@ -68,20 +69,54 @@ def _try_bare_json_tool_call(response_text: str) -> dict | None:
     return obj
 
 
+def _try_complete_json_after_open_fence(response_text: str) -> dict | None:
+    """A ```tool fence was opened but TOOL_BLOCK_RE found no closing fence --
+    before assuming the content was truncated (cut off by the completion-
+    token limit), check whether the JSON object right after the opening
+    marker is actually already complete. Observed in a live run: five
+    consecutive short, well-formed tool calls (e.g. a single read_file,
+    maybe 60 characters of JSON) each missing only their closing ``` despite
+    being nowhere near large enough to be genuinely truncated -- a chat-
+    template/bridge quirk that strips the closing fence, not a length
+    problem. JSON is self-delimiting, so the closing fence was never
+    actually needed to know where the object ends; a real JSONDecodeError
+    here (content that doesn't parse even without a trailing fence) still
+    means true truncation, and falls through to that error as before."""
+    open_match = _OPEN_FENCE_RE.search(response_text)
+    if open_match is None:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(response_text, open_match.end())
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or "name" not in obj or "arguments" not in obj:
+        return None
+    if obj["name"] not in VALID_TOOLS or not isinstance(obj["arguments"], dict):
+        return None
+    return obj
+
+
 def extract_tool_call(response_text: str) -> dict | None:
     """Returns the parsed {"name": ..., "arguments": {...}} dict, or None if
     the response has no ```tool block at all (meaning the model is done).
-    Raises ToolCallParseError if a block exists but is malformed -- including
-    the case where a ```tool block was opened but never closed, which means
-    the model's own completion-token limit cut it off mid-write rather than
-    the model actually finishing. Without this distinction, a truncated large
-    write_file call (no tools block, no closing fence) looks identical to
-    "no tool call at all" and gets mistaken for the model signaling it's
-    done -- the write never runs, and the garbled cutoff gets saved as if it
-    were the final report."""
+
+    An opened-but-unclosed fence is recovered directly when the JSON right
+    after the opening marker is already complete (see
+    _try_complete_json_after_open_fence -- observed live: short, well-formed
+    calls missing only their closing ``` from what looks like a chat-
+    template/bridge quirk, not actual truncation). Only when that JSON is
+    itself unparseable does this raise ToolCallParseError for a genuine
+    truncation (the model's own completion-token limit cutting off a large
+    write_file mid-write) -- without that distinction, a truncated call
+    looks identical to "no tool call at all" and gets mistaken for the model
+    signaling it's done, so the write never runs and the garbled cutoff gets
+    saved as if it were the final report."""
     match = TOOL_BLOCK_RE.search(response_text)
     if match is None:
         if "```tool" in response_text:
+            recovered = _try_complete_json_after_open_fence(response_text)
+            if recovered is not None:
+                return recovered
             raise ToolCallParseError(
                 "Your last response started a ```tool block but never closed it -- "
                 "it looks like the content was too large and got cut off before "

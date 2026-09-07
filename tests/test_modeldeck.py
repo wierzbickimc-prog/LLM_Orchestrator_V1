@@ -52,7 +52,7 @@ class CommandTests(unittest.TestCase):
     def test_model_command_contains_memory_and_cache_contract(self) -> None:
         role = default_state()["roles"]["scout"]
         command, environment = model_command("scout", role, Path("/mtplx"))
-        self.assertIn("100000", command)
+        self.assertIn("131072", command)
         self.assertIn("10G", command)
         self.assertEqual(environment["MTPLX_SESSION_BANK_MAX_BYTES"], "16G")
         self.assertEqual(environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "12G")

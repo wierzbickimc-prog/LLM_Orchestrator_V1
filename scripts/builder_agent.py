@@ -32,7 +32,15 @@ from report_common import (
     stream_chat,
 )
 
-DEFAULT_MAX_STEPS = 40
+DEFAULT_MAX_STEPS = 80
+# 40 wasn't enough in a live run: Builder's own final report used an
+# explicit [x]/[ ] checklist showing it knew devices.py/qc.py/serve.py/tests
+# were unfinished, but signaled done anyway instead of continuing. Whether
+# that was step-budget pressure or something else isn't confirmed (no
+# transcript was kept), but raising the ceiling is the cheap, low-risk
+# thing to try before touching reasoning="off", which is deliberate (see
+# the role-default comments in modeldeck/state.py) and shouldn't change
+# without isolated testing.
 DEFAULT_COMMAND_TIMEOUT = 120.0
 
 SYSTEM_PROMPT_TEMPLATE = """You are a careful software engineer implementing an \
@@ -105,11 +113,18 @@ def run_agent(
     timeout: float,
     dry_run: bool,
     on_chunk,
+    model_alias: str = "builder",
 ) -> tuple[str, int, list[str]]:
     """Returns (final_report_text, steps_taken, touched_files) -- touched_files
     is every relative path passed to write_file/append_file this run (deduped,
     sorted), for the Auditor to prioritize instead of treating the whole tree
-    as equally likely to matter."""
+    as equally likely to matter.
+
+    model_alias exists so renovator_agent.py can reuse this exact loop on a
+    different backend: Builder and Renovator are deliberately on different
+    models (fast MoE for the bulk pass, dense for expert cleanup -- see the
+    role comments in modeldeck/state.py), which they can't be while sharing
+    one alias."""
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(plan=plan)
     user_intro = "Begin." if not task else f"Begin. Additional note from the requester:\n{task}"
     messages: list[dict[str, str]] = [
@@ -121,7 +136,7 @@ def run_agent(
     for step in range(1, max_steps + 1):
         on_chunk(f"\n--- step {step} ---\n")
         response = stream_chat(
-            "builder", messages, on_chunk=on_chunk, router_url=router_url, timeout=timeout
+            model_alias, messages, on_chunk=on_chunk, router_url=router_url, timeout=timeout
         )
         messages.append({"role": "assistant", "content": response})
 

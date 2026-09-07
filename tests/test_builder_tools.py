@@ -41,6 +41,26 @@ class ExtractToolCallTests(unittest.TestCase):
         self.assertIn("cut off", str(ctx.exception))
         self.assertIn("append_file", str(ctx.exception))
 
+    def test_short_complete_call_missing_only_closing_fence_is_recovered(self) -> None:
+        # Observed in a live run: five consecutive short, well-formed tool
+        # calls (e.g. a single read_file, ~60 chars of JSON) each missing
+        # only their closing ``` despite being nowhere near large enough to
+        # be genuinely truncated. The JSON itself is complete and valid, so
+        # this must be recovered directly, not treated as a truncation to
+        # retry (which wastes a step every time and never succeeds).
+        text = '```tool\n{"name": "read_file", "arguments": {"path": "thermocycler_core.py"}}'
+        call = extract_tool_call(text)
+        self.assertEqual(call, {"name": "read_file", "arguments": {"path": "thermocycler_core.py"}})
+
+    def test_genuinely_truncated_mid_string_still_raises(self) -> None:
+        # An opening fence whose JSON is actually incomplete (unterminated
+        # string, as a large write_file cut off mid-generation would look)
+        # must still be reported as truncated, not silently swallowed.
+        truncated = '```tool\n{"name": "write_file", "arguments": {"path": "a.py", "content": "no closing quote'
+        with self.assertRaises(ToolCallParseError) as ctx:
+            extract_tool_call(truncated)
+        self.assertIn("cut off", str(ctx.exception))
+
     def test_bare_json_tool_call_with_no_fence_is_recovered(self) -> None:
         # Observed in a live run: the fence markers were stripped entirely
         # (not truncated -- there's no "```tool" substring anywhere), leaving

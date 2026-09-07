@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -231,20 +230,6 @@ class SecretDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-
-
-class MetricCard(QFrame):
-    def __init__(self, title: str):
-        super().__init__()
-        self.setObjectName("metricCard")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 9, 12, 9)
-        heading = QLabel(title.upper())
-        heading.setObjectName("metricHeading")
-        self.value = QLabel("—")
-        self.value.setObjectName("metricValue")
-        layout.addWidget(heading)
-        layout.addWidget(self.value)
 
 
 class RoleEditor(QGroupBox):
@@ -582,7 +567,7 @@ class MainWindow(QMainWindow):
         if kind_index >= 0:
             self.planner_kind.setCurrentIndex(kind_index)
         self.planner_local_phase = QComboBox()
-        for phase in ("scout", "builder", "auditor"):
+        for phase in ("scout", "builder", "renovator", "auditor"):
             self.planner_local_phase.addItem(phase.title(), phase)
         phase_index = self.planner_local_phase.findData(
             str(self.state["planner"].get("local_phase", "builder"))
@@ -616,7 +601,7 @@ class MainWindow(QMainWindow):
         self._update_planner_backend_visibility()
 
         self.editors: dict[str, RoleEditor] = {}
-        for phase in ("scout", "builder", "auditor"):
+        for phase in ("scout", "builder", "renovator", "auditor"):
             editor = RoleEditor(phase.title(), models, self.state["roles"][phase])
             layout.addWidget(editor)
             self.editors[phase] = editor
@@ -640,43 +625,26 @@ class MainWindow(QMainWindow):
         # Live in-flight status -- from /v1/mtplx/flight, which (unlike
         # /metrics) updates *during* a request, not only after it finishes.
         # This is the actual answer to "is it stuck or just thinking": phase
-        # (prefill vs decode), live tok/s, and a tail of what it's writing.
+        # (prefill vs decode), live tok/s, MTP depth acceptance, and a tail
+        # of what it's writing. This replaced a second box ("Last completed
+        # request", a 6-card grid fed by /metrics) that could only ever show
+        # the *previous* request's numbers, frozen for the entire duration
+        # of whatever's actually running -- confusing next to a box that's
+        # genuinely live. Everything that box could show live is folded in
+        # here instead; nothing here is real until the first request lands.
         live_box = QGroupBox("Current request")
         live_layout = QVBoxLayout(live_box)
         self.live_status = QLabel("Idle -- no request in flight")
         self.live_status.setObjectName("liveStatus")
+        self.live_depth = QLabel("MTP depth: —")
         self.live_tail = QPlainTextEdit()
         self.live_tail.setReadOnly(True)
         self.live_tail.setMaximumHeight(60)
         self.live_tail.setPlaceholderText("A live tail of what the model is currently writing appears here.")
         live_layout.addWidget(self.live_status)
+        live_layout.addWidget(self.live_depth)
         live_layout.addWidget(self.live_tail)
         layout.addWidget(live_box)
-
-        # Named for what it actually is, not what it sounds like: /metrics'
-        # "latest" only updates once a request finishes, so every field here
-        # shows the *previous* completed request's numbers and goes stale
-        # (not blank, just frozen) for the entire duration of whatever's
-        # running now. "Current request" above is the one that's genuinely
-        # live -- this one used to also be labeled "Live telemetry", which
-        # reads as broken the whole time something's actually in flight.
-        metric_group = QGroupBox("Last completed request")
-        metric_layout = QGridLayout(metric_group)
-        self.cards: dict[str, MetricCard] = {}
-        for index, (key, label) in enumerate(
-            (
-                ("prefill", "Prefill"),
-                ("decode", "Decode"),
-                ("ttft", "TTFT"),
-                ("memory", "Active memory"),
-                ("cache", "Cached tokens"),
-                ("depth", "MTP depth"),
-            )
-        ):
-            card = MetricCard(label)
-            metric_layout.addWidget(card, index // 3, index % 3)
-            self.cards[key] = card
-        layout.addWidget(metric_group)
 
         context_box = QGroupBox("Last request context")
         context_layout = QVBoxLayout(context_box)
@@ -840,23 +808,6 @@ class MainWindow(QMainWindow):
         state = load_state()
         if phase == "planner":
             activate_planner(state)
-        elif phase == "renovator":
-            # renovator_agent.py calls the router alias "builder" (it's
-            # builder's own agent loop, just rescoped) -- there's no
-            # separate "renovator" role/port to point telemetry at, so
-            # activate_local(state, "builder") would work for the metrics
-            # themselves but would also relabel the ACTIVE badge as
-            # "BUILDER", which is the one place a glance at the Deck tab
-            # (not just the Reports tab's per-phase row) tells you a repair
-            # pass is actually underway. Point telemetry at builder's port
-            # while keeping the phase label "renovator".
-            role = state["roles"]["builder"]
-            state["active"] = {
-                "phase": "renovator",
-                "kind": "local",
-                "base_url": f"http://127.0.0.1:{int(role['port'])}/v1",
-                "model_id": "builder",
-            }
         else:
             activate_local(state, phase)
         save_state(state)
@@ -870,8 +821,6 @@ class MainWindow(QMainWindow):
             if self.state["planner"].get("kind") == "local":
                 return str(self.state["planner"].get("local_phase") or "builder")
             return None
-        if phase == "renovator":
-            return "builder"  # renovator is builder's own agent loop, narrowly rescoped
         return phase
 
     def _ensure_role_resident(self, role_name: str | None) -> None:
@@ -1372,15 +1321,6 @@ class MainWindow(QMainWindow):
             # to estimate an ETA from.
             self._last_prefill_rate[phase] = float(latest["prefill_tok_s"])
         self._refresh_flight(base, phase)
-        self.cards["prefill"].value.setText(self._rate(latest.get("prefill_tok_s")))
-        self.cards["decode"].value.setText(self._rate(latest.get("decode_tok_s")))
-        self.cards["ttft"].value.setText(self._seconds(latest.get("ttft_s")))
-        self.cards["memory"].value.setText(self._gib(latest.get("active_memory_bytes")))
-        cached = int(latest.get("cached_tokens") or 0)
-        prompt = int(latest.get("prompt_tokens") or 0)
-        self.cards["cache"].value.setText(f"{cached:,} / {prompt:,}")
-        depth = latest.get("mtp_depth", health.get("depth"))
-        self.cards["depth"].value.setText(f"D{depth}" if depth else "—")
 
         used = int(latest.get("context_len") or 0)
         maximum = int(health.get("context_window") or 0)
@@ -1414,14 +1354,13 @@ class MainWindow(QMainWindow):
         )
 
     def _clear_metrics(self, detail: str) -> None:
-        for card in self.cards.values():
-            card.value.setText("—")
         self.context_label.setText(detail)
         self.context_bar.setValue(0)
         self.acceptance.setText("P1 —   P2 —   P3 —")
         self.cache_detail.setText("Cache —")
         self.thermal.setText("Thermal —")
         self.live_status.setText("Idle -- no request in flight")
+        self.live_depth.setText("MTP depth: —")
         self.live_tail.setPlainText("")
 
     def _refresh_flight(self, base: str, role_phase: str) -> None:
@@ -1442,11 +1381,13 @@ class MainWindow(QMainWindow):
             flight = fetch_json(f"{base}/v1/mtplx/flight", timeout=0.3)
         except Exception:
             self.live_status.setText("Idle -- no request in flight")
+            self.live_depth.setText("MTP depth: —")
             self.live_tail.setPlainText("")
             return
         active = flight.get("active") or []
         if not active:
             self.live_status.setText("Idle -- no request in flight")
+            self.live_depth.setText("MTP depth: —")
             self.live_tail.setPlainText("")
             return
         request = active[0]
@@ -1470,6 +1411,19 @@ class MainWindow(QMainWindow):
             f"{prompt_tokens:,} prompt tok  ·  {gen_tokens:,} generated  ·  "
             f"{self._seconds(elapsed)} elapsed{eta_text}"
         )
+        accepted = request.get("accepted_by_depth") or []
+        drafted = request.get("drafted_by_depth") or []
+        if accepted or drafted:
+            parts = []
+            for index in range(max(len(accepted), len(drafted))):
+                a = accepted[index] if index < len(accepted) else 0
+                d = drafted[index] if index < len(drafted) else 0
+                percent = (a / d * 100.0) if d else 0.0
+                parts.append(f"D{index + 1} {a}/{d} ({percent:.0f}%)")
+            self.live_depth.setText("MTP depth (accepted/drafted this request): " + "  ".join(parts))
+        else:
+            self.live_depth.setText("MTP depth: —")
+
         tail = request.get("tail")
         if isinstance(tail, str) and tail:
             self.live_tail.setPlainText(tail)
@@ -1520,9 +1474,6 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { background: #171e28; color: #e7
                                 border: 1px solid #334258; border-radius: 6px; padding: 6px; }
 QComboBox QAbstractItemView { background: #171e28; color: #e7edf6;
                                selection-background-color: #29374a; }
-QFrame#metricCard { background: #171e28; border: 1px solid #273244; border-radius: 8px; }
-QLabel#metricHeading { color: #77869a; font-size: 10px; font-weight: 700; }
-QLabel#metricValue { color: #f8fafc; font-size: 19px; font-weight: 700; }
 QLabel#diagram { background: #0b0f14; color: #7dd3fc; padding: 18px;
                  border: 1px solid #273244; border-radius: 10px; }
 QLabel#workflowNote { color: #aebbd0; padding: 8px 2px; }

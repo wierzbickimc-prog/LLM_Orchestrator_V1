@@ -1,0 +1,75 @@
+# Improvements to-do
+
+Running list of things noticed during real pipeline runs, captured here
+instead of getting lost in conversation. Add an entry the moment something
+is spotted, even mid-run -- don't wait until a run finishes to write it
+down. Mark it Done with a one-line note on what actually changed once it
+ships; don't delete finished entries, they're a record of why something is
+the way it is.
+
+## Open
+
+- **Chunk Builder's work per plan-step instead of one long accumulating
+  session.** Right now `builder_agent.py` runs the *entire* plan as one
+  conversation: every file read, every write_file/tool result, stays in
+  context for the rest of the run, so context grows monotonically and
+  nothing is ever paged out. On a real multi-file task this hit 95K/104K
+  prompt tokens by step 25 (see the 128K context_window bump below, a
+  mitigation, not a fix for this). A task-chunked design would run one
+  Builder invocation per plan step (or per logical group of steps) with a
+  *fresh* context each time -- fed the specific step's requirements plus a
+  short on-disk progress ledger (e.g. `.ai/builder-progress.md`, a running
+  checklist, not a full transcript) instead of the whole prior conversation.
+  Files are re-read fresh from disk each step regardless (correctness is
+  fine -- the file-content cache in `report_common.build_context` already
+  avoids the disk-I/O cost of re-reading unchanged files), so this is really
+  about not re-sending an ever-growing transcript to the model every turn.
+  Tradeoffs to weigh before building this:
+  - Real benefit: bounded context per step regardless of total plan size,
+    so this class of failure (context ceiling hit mid-task) stops scaling
+    with plan size at all.
+  - Real cost: per-step re-invocation overhead (fresh system prompt, model
+    warmup already resident so that's cheap, but re-establishing situational
+    awareness each step isn't free) -- likely not worth it for a plan with
+    only 1-2 small steps.
+  - Needs the progress ledger to carry forward decisions made in an earlier
+    step that a later step depends on (e.g. "Step 1 chose the Worker-buffer
+    approach over widening history" needs to be visible to Step 4 even
+    though Step 4's fresh context never saw Step 1's reasoning play out).
+  - Testing/verification probably still wants to happen once, after all
+    steps land, not fragmented per-step -- a final "integration" pass.
+
+- **Benchmark the Builder/Renovator model split (shipped, unvalidated).**
+  Builder moved to the MoE (Qwen3.6-35B-A3B, instruct) and Renovator got
+  its own role on the dense model (Qwen3.8-27B, instruct): fast bulk pass,
+  expert cleanup. Nothing about this is measured yet, and there is one
+  specific unknown that matters: every tool-call pathology seen so far
+  (stripped/missing ```tool fences, the bare-JSON case, the
+  complete-but-unfenced case) happened on the dense model's "tokenizer"
+  chat template. The MoE uses "local_qwen36" and has never been asked to
+  emit a tool call in a loop at all -- scout and auditor are both one-shot
+  text. So this could be a clean win, or it could trade a reasoning
+  bottleneck for a tool-call-reliability one. What to measure:
+  - Wall-clock for Builder alone, vs. the ~2700s dense baseline.
+  - Steps consumed, and how many were lost to tool-call parse retries.
+  - Whether Auditor's verdict quality changes (does the fast pass leave a
+    *cleanup*-sized fix list, or a rebuild-sized one? The whole economics
+    of "95% fast, then expert" depends on that number being small).
+  - Whether Renovator-on-dense actually closes a fix list it's handed.
+
+## Done
+
+- **Reports tab: replaced the "Last completed request" telemetry box (fed
+  by `/metrics`, which only updates once a request finishes -- frozen for
+  the entire duration of whatever's actually running) with genuinely live
+  data folded into the "Current request" box** (phase, live tok/s, prompt/
+  generated token counts, elapsed time, prefill ETA estimate, MTP depth
+  acceptance -- all from `/v1/mtplx/flight`, which updates *during* a
+  request). Removed the now-dead `MetricCard` class and its styling.
+- **Raised `context_window` from ~100K to 131,072 (128K) for scout/builder/
+  auditor**, after a live Builder run hit 95K/104K prompt tokens by step 25
+  on a multi-file task. Confirmed real RAM headroom first (64G box, ~20G
+  resident for weights+context) rather than guessing. Deliberately capped
+  at 128K rather than raised further: a bigger window costs more prefill
+  time per request regardless of whether it's filled, so this is a real
+  speed/room tradeoff, not a free upgrade.
