@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -39,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .mtplx import PROJECT_DIR, ProcessManager, fetch_json, installed_models, post_json
+from .mtplx import PROJECT_DIR, ProcessManager, fetch_json, fetch_sse_snapshot, installed_models, post_json
 from .prompts import PROMPTS
 from .secrets import get_openai_api_key, set_openai_api_key
 from .state import activate_local, activate_planner, load_state, sampling_preset, save_state
@@ -439,6 +440,25 @@ class PromptCard(QGroupBox):
         self.set_override_state(False)
 
 
+class MetricCard(QFrame):
+    """One dashboard tile: a small heading over a big value, used for the
+    live process-parameter grid in the Reports tab (see MainWindow.
+    _build_telemetry / _refresh_flight)."""
+
+    def __init__(self, title: str):
+        super().__init__()
+        self.setObjectName("metricCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        heading = QLabel(title.upper())
+        heading.setObjectName("metricHeading")
+        self.value = QLabel("—")
+        self.value.setObjectName("metricValue")
+        self.value.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(self.value)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -622,28 +642,45 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Live in-flight status -- from /v1/mtplx/flight, which (unlike
-        # /metrics) updates *during* a request, not only after it finishes.
-        # This is the actual answer to "is it stuck or just thinking": phase
-        # (prefill vs decode), live tok/s, MTP depth acceptance, and a tail
-        # of what it's writing. This replaced a second box ("Last completed
-        # request", a 6-card grid fed by /metrics) that could only ever show
-        # the *previous* request's numbers, frozen for the entire duration
-        # of whatever's actually running -- confusing next to a box that's
-        # genuinely live. Everything that box could show live is folded in
-        # here instead; nothing here is real until the first request lands.
+        # Live process-parameter dashboard -- from /v1/mtplx/flight, which
+        # (unlike /metrics) updates *during* a request, not only after it
+        # finishes. This is the actual answer to "is it stuck or just
+        # thinking": which model, current phase (prefill vs decode), live
+        # tok/s, token counts, elapsed time, and MTP depth acceptance, all
+        # in the same card layout the old (post-hoc, /metrics-fed) grid
+        # used -- just wired to a source that's actually live during a run
+        # instead of frozen until the request finishes.
         live_box = QGroupBox("Current request")
-        live_layout = QVBoxLayout(live_box)
+        live_box_layout = QVBoxLayout(live_box)
         self.live_status = QLabel("Idle -- no request in flight")
         self.live_status.setObjectName("liveStatus")
-        self.live_depth = QLabel("MTP depth: —")
+        live_box_layout.addWidget(self.live_status)
+
+        live_grid = QGridLayout()
+        self.live_cards: dict[str, MetricCard] = {}
+        for index, (key, label) in enumerate(
+            (
+                ("model", "Model"),
+                ("phase", "Phase"),
+                ("prefill_rate", "Prefill rate (last measured)"),
+                ("decode_now", "Decode now"),
+                ("decode_avg", "Decode avg"),
+                ("prompt_tokens", "Prompt tokens"),
+                ("gen_tokens", "Generated"),
+                ("elapsed", "Elapsed"),
+                ("depth", "MTP depth (acc/draft)"),
+            )
+        ):
+            card = MetricCard(label)
+            live_grid.addWidget(card, index // 4, index % 4)
+            self.live_cards[key] = card
+        live_box_layout.addLayout(live_grid)
+
         self.live_tail = QPlainTextEdit()
         self.live_tail.setReadOnly(True)
         self.live_tail.setMaximumHeight(60)
         self.live_tail.setPlaceholderText("A live tail of what the model is currently writing appears here.")
-        live_layout.addWidget(self.live_status)
-        live_layout.addWidget(self.live_depth)
-        live_layout.addWidget(self.live_tail)
+        live_box_layout.addWidget(self.live_tail)
         layout.addWidget(live_box)
 
         context_box = QGroupBox("Last request context")
@@ -1320,7 +1357,7 @@ class MainWindow(QMainWindow):
             # itself reports no rate -- see _refresh_flight) has something
             # to estimate an ETA from.
             self._last_prefill_rate[phase] = float(latest["prefill_tok_s"])
-        self._refresh_flight(base, phase)
+        self._refresh_flight(base, phase, health)
 
         used = int(latest.get("context_len") or 0)
         maximum = int(health.get("context_window") or 0)
@@ -1360,34 +1397,91 @@ class MainWindow(QMainWindow):
         self.cache_detail.setText("Cache —")
         self.thermal.setText("Thermal —")
         self.live_status.setText("Idle -- no request in flight")
-        self.live_depth.setText("MTP depth: —")
+        self._clear_live_cards()
         self.live_tail.setPlainText("")
 
-    def _refresh_flight(self, base: str, role_phase: str) -> None:
-        """Live in-progress request status from mtplx's own flight log --
+    @staticmethod
+    def _model_label(health: dict[str, Any]) -> str:
+        """A short, readable model name for the dashboard's Model card --
+        health's own "model" field is just the router alias (e.g. "scout"),
+        not which actual weights are loaded, so pull the repo name out of
+        model_path instead."""
+        alias = str(health.get("model") or "—")
+        path = str(health.get("model_path") or "")
+        repo = path.rsplit("/", 1)[-1] if path else ""
+        repo = repo.split("--", 1)[-1] if "--" in repo else repo
+        repo = repo.replace("-MTPLX-Optimized-Speed-FP16", "")
+        return f"{alias} ({repo})" if repo else alias
+
+    def _clear_live_cards(self) -> None:
+        for card in self.live_cards.values():
+            card.value.setText("—")
+
+    @staticmethod
+    def _live_prefill_rate(base: str) -> tuple[float, int] | None:
+        """(tokens/sec, tokens_done) for the current prefill chunk, from
+        /v1/mtplx/metrics/stream's in_flight[].prefill_state -- see
+        _refresh_flight's docstring. Returns None if there's no in-flight
+        request, or if it hasn't finished its first chunk yet (tokens_done
+        still 0), in which case the caller falls back to the historical
+        estimate."""
+        try:
+            snapshot = fetch_sse_snapshot(f"{base}/v1/mtplx/metrics/stream?snapshot_interval_ms=50", timeout=0.3)
+        except Exception:
+            return None
+        in_flight = snapshot.get("in_flight") or []
+        if not in_flight:
+            return None
+        prefill_state = in_flight[0].get("prefill_state") or {}
+        tokens_done = int(prefill_state.get("tokens_done") or 0)
+        elapsed = prefill_state.get("elapsed_s")
+        if tokens_done <= 0 or not elapsed:
+            return None
+        return tokens_done / float(elapsed), tokens_done
+
+    def _refresh_flight(self, base: str, role_phase: str, health: dict[str, Any]) -> None:
+        """Live process-parameter dashboard from mtplx's own flight log --
         this is what actually updates during prefill/decode, unlike
         /metrics (whose "latest" stays null until a request finishes). Best
         effort: an older mtplx build without this endpoint just shows Idle,
-        same as no request being in flight.
+        same as no request being in flight. Model card always reflects
+        health (genuinely live server state) even when idle -- everything
+        else needs an in-flight request to mean anything.
 
-        During an active prefill, mtplx's own numbers are of no help for an
-        ETA: "prefill" is null and tps_now/tps_avg are both 0 for the whole
-        phase (confirmed empirically, not documented) -- prompt_tokens is
-        the only thing known up front. So the estimate here is deliberately
-        approximate: prompt_tokens divided by the *last completed request's*
-        prefill_tok_s for this role (from refresh_metrics), labeled as an
-        estimate so it isn't mistaken for a live measurement."""
+        During an active prefill, /v1/mtplx/flight's own numbers are no help
+        for a rate or ETA: "prefill" is null and tps_now/tps_avg are both 0
+        for the whole phase (confirmed empirically, not documented). The
+        real live per-chunk progress (tokens_done/tokens_total/elapsed_s)
+        only exists on /v1/mtplx/metrics/stream's in_flight[].prefill_state
+        -- confirmed against mtplx's own app, which reads this same field
+        for its live "prefill tps / ETA" gauge. That's an SSE endpoint, but
+        each event is a full snapshot (not a delta), so one connect-read-
+        close per refresh tick works fine -- no persistent connection
+        needed. Only queried while phase == "prefill", to avoid the extra
+        request on every tick. If tokens_done is still 0 (prefill hasn't
+        finished its first chunk yet, e.g. a short prompt that completes
+        within one 2048-token chunk before this ever gets called), falls
+        back to the same last-completed-request estimate as before."""
+        known_rate = self._last_prefill_rate.get(role_phase)
+        prefill_rate_text = f"{known_rate:.0f} tok/s" if known_rate else "—"
+
+        self.live_cards["model"].value.setText(self._model_label(health))
+        self.live_cards["prefill_rate"].value.setText(prefill_rate_text)
         try:
             flight = fetch_json(f"{base}/v1/mtplx/flight", timeout=0.3)
         except Exception:
             self.live_status.setText("Idle -- no request in flight")
-            self.live_depth.setText("MTP depth: —")
+            self._clear_live_cards()
+            self.live_cards["model"].value.setText(self._model_label(health))
+            self.live_cards["prefill_rate"].value.setText(prefill_rate_text)
             self.live_tail.setPlainText("")
             return
         active = flight.get("active") or []
         if not active:
             self.live_status.setText("Idle -- no request in flight")
-            self.live_depth.setText("MTP depth: —")
+            self._clear_live_cards()
+            self.live_cards["model"].value.setText(self._model_label(health))
+            self.live_cards["prefill_rate"].value.setText(prefill_rate_text)
             self.live_tail.setPlainText("")
             return
         request = active[0]
@@ -1400,17 +1494,24 @@ class MainWindow(QMainWindow):
 
         eta_text = ""
         if request_phase == "prefill":
-            known_rate = self._last_prefill_rate.get(role_phase)
-            if known_rate:
+            live_rate = self._live_prefill_rate(base)
+            if live_rate:
+                remaining_tokens = max(prompt_tokens - live_rate[1], 0)
+                eta_text = f"  ·  live {live_rate[0]:.0f} tok/s  ·  {remaining_tokens / live_rate[0]:.0f}s remaining ({live_rate[1]:,}/{prompt_tokens:,} tok)"
+                self.live_cards["prefill_rate"].value.setText(f"{live_rate[0]:.0f} tok/s (live)")
+            elif known_rate:
                 eta_text = f"  ·  est. {prompt_tokens / known_rate:.0f}s remaining (from last request's {known_rate:.0f} tok/s)"
             else:
                 eta_text = "  ·  no prior request this session to estimate a prefill ETA from"
+        self.live_status.setText(f"● live{eta_text}")
 
-        self.live_status.setText(
-            f"● {request_phase}  ·  {self._rate(tps_now)} now (avg {self._rate(tps_avg)})  ·  "
-            f"{prompt_tokens:,} prompt tok  ·  {gen_tokens:,} generated  ·  "
-            f"{self._seconds(elapsed)} elapsed{eta_text}"
-        )
+        self.live_cards["phase"].value.setText(request_phase)
+        self.live_cards["decode_now"].value.setText(self._rate(tps_now))
+        self.live_cards["decode_avg"].value.setText(self._rate(tps_avg))
+        self.live_cards["prompt_tokens"].value.setText(f"{prompt_tokens:,}")
+        self.live_cards["gen_tokens"].value.setText(f"{gen_tokens:,}")
+        self.live_cards["elapsed"].value.setText(self._seconds(elapsed))
+
         accepted = request.get("accepted_by_depth") or []
         drafted = request.get("drafted_by_depth") or []
         if accepted or drafted:
@@ -1420,9 +1521,9 @@ class MainWindow(QMainWindow):
                 d = drafted[index] if index < len(drafted) else 0
                 percent = (a / d * 100.0) if d else 0.0
                 parts.append(f"D{index + 1} {a}/{d} ({percent:.0f}%)")
-            self.live_depth.setText("MTP depth (accepted/drafted this request): " + "  ".join(parts))
+            self.live_cards["depth"].value.setText("  ".join(parts))
         else:
-            self.live_depth.setText("MTP depth: —")
+            self.live_cards["depth"].value.setText("—")
 
         tail = request.get("tail")
         if isinstance(tail, str) and tail:
@@ -1474,6 +1575,9 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { background: #171e28; color: #e7
                                 border: 1px solid #334258; border-radius: 6px; padding: 6px; }
 QComboBox QAbstractItemView { background: #171e28; color: #e7edf6;
                                selection-background-color: #29374a; }
+QFrame#metricCard { background: #171e28; border: 1px solid #273244; border-radius: 8px; }
+QLabel#metricHeading { color: #77869a; font-size: 10px; font-weight: 700; }
+QLabel#metricValue { color: #f8fafc; font-size: 19px; font-weight: 700; }
 QLabel#diagram { background: #0b0f14; color: #7dd3fc; padding: 18px;
                  border: 1px solid #273244; border-radius: 10px; }
 QLabel#workflowNote { color: #aebbd0; padding: 8px 2px; }

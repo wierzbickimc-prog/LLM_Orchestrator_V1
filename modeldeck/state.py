@@ -159,9 +159,26 @@ def default_state() -> dict[str, Any]:
             # MoE's "local_qwen36" template behaves in a long tool-use
             # loop, because scout/auditor never emit tool calls. Benchmark
             # before trusting it -- see docs/IMPROVEMENTS_TODO.md.
+            #
+            # reasoning="auto" + thinking_precise, not "off"+instruct
+            # (EXPERIMENT, live): a first live attempt on reasoning="off"
+            # produced a single clean sentence announcing intent ("I'll
+            # start by reading... let me begin by reading the key files")
+            # and then no tool call at all -- not truncated, not malformed,
+            # just no follow-through, on the model's very first turn, zero
+            # files touched. reasoning="off"+instruct is exactly what the
+            # dense model used successfully every time, so the model is the
+            # only thing that changed -- but Qwen3.6 is a different
+            # architecture (MoE, not dense) and may need actual reasoning
+            # space to commit to an action, where the dense model didn't.
+            # Testing that theory in isolation: only this pairing changed,
+            # nothing else. If it doesn't fix the no-follow-through pattern,
+            # revert to reasoning="off"/instruct and treat this model as
+            # not viable for Builder's tool loop -- see
+            # docs/IMPROVEMENTS_TODO.md for the outcome either way.
             "builder": _role(
-                DEFAULT_SCOUT, 8002, "off", "auto", 131_072, 3,
-                sampling_mode="instruct",
+                DEFAULT_SCOUT, 8002, "auto", "medium", 131_072, 3,
+                sampling_mode="thinking_precise",
             ),
             # Renovator gets its own role rather than reusing Builder's, so
             # the two can run different models. Deliberately left on

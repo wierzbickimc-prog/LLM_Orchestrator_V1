@@ -22,6 +22,29 @@ def fetch_json(url: str, timeout: float = 0.6) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def fetch_sse_snapshot(url: str, timeout: float = 0.6) -> dict[str, Any]:
+    """One-shot read of the first event from an SSE endpoint, then closes
+    the connection -- for /v1/mtplx/metrics/stream, whose events are each a
+    full self-contained snapshot (not a delta), so there's no need to hold
+    the connection open like a real subscriber would. This is the only
+    channel that carries live per-chunk prefill progress (in_flight[].
+    prefill_state: tokens_done/tokens_total/elapsed_s) -- confirmed
+    empirically against mtplx's own app, which reads this same data for
+    its live "prefill tps / ETA" gauge. /v1/mtplx/flight (used everywhere
+    else in this module) never carries it at all, at any prompt size."""
+    request = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if line.startswith("data:"):
+                try:
+                    value = json.loads(line[len("data:"):].strip())
+                except ValueError:
+                    return {}
+                return value if isinstance(value, dict) else {}
+    return {}
+
+
 def post_json(url: str, body: dict[str, Any], timeout: float = 0.6) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
