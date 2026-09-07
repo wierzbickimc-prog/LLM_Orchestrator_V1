@@ -8,12 +8,51 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from report_common import (  # noqa: E402
+    DEFAULT_EXTENSIONS,
+    collect_files,
     describe_skipped,
     looks_like_failed_tool_call,
     parse_verdict,
     referenced_files,
     resolve_ai_path,
 )
+
+
+class CollectFilesSwiftPackageTests(unittest.TestCase):
+    def test_finds_swift_sources_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Sources" / "MyApp").mkdir(parents=True)
+            (root / "Sources" / "MyApp" / "Feature.swift").write_text("struct Feature {}")
+            (root / "Package.swift").write_text("// swift-tools-version:5.9")
+            found = {p.name for p in collect_files(root, DEFAULT_EXTENSIONS)}
+            self.assertIn("Feature.swift", found)
+            self.assertIn("Package.swift", found)
+
+    def test_ignores_build_and_package_manager_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".build" / "checkouts").mkdir(parents=True)
+            (root / ".build" / "checkouts" / "Dependency.swift").write_text("// vendored")
+            (root / ".swiftpm").mkdir()
+            (root / ".swiftpm" / "state.json").write_text("{}")
+            found = {p.name for p in collect_files(root, DEFAULT_EXTENSIONS)}
+            self.assertNotIn("Dependency.swift", found)
+            self.assertNotIn("state.json", found)
+
+    def test_ignores_xcode_project_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "MyApp.xcodeproj" / "xcshareddata"
+            bundle.mkdir(parents=True)
+            (root / "MyApp.xcodeproj" / "project.pbxproj").write_text("// plist")
+            # .plist IS a tracked extension now, so this specifically tests
+            # that the ignored-dir entry (not just the extension filter)
+            # keeps the pipeline out of Xcode's project bundle.
+            (bundle / "WorkspaceSettings.plist").write_text("<plist/>")
+            found = {p.name for p in collect_files(root, DEFAULT_EXTENSIONS)}
+            self.assertNotIn("project.pbxproj", found)
+            self.assertNotIn("WorkspaceSettings.plist", found)
 
 
 class ResolveAiPathTests(unittest.TestCase):

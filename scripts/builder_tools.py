@@ -151,6 +151,35 @@ def _safe_path(root: Path, relative: str) -> Path:
     return candidate
 
 
+# Xcode's project.pbxproj is a serialized property list tracking every file
+# reference, target, and build phase -- fragile even between two human
+# engineers, and write_file's only primitive is "replace the whole file", so
+# one bad regeneration can silently break the project's buildability with no
+# diff an Auditor pass could meaningfully review. ".build"/".swiftpm" are
+# generated Swift Package Manager state, never something to hand-edit either.
+# Xcode's bundles are always named "<Project>.xcodeproj"/"<Project>.
+# xcworkspace" -- a suffix, not a literal directory name like the other two.
+_PROTECTED_BUNDLE_NAMES = (".build", ".swiftpm")
+_PROTECTED_BUNDLE_SUFFIXES = (".xcodeproj", ".xcworkspace")
+
+
+def _reject_protected_bundle_write(path: Path) -> str | None:
+    """Returns an error message if path falls inside a protected bundle/build
+    directory, else None. Checked only for write_file/append_file -- reading
+    is harmless and sometimes legitimately useful (e.g. inspecting
+    Package.resolved)."""
+    for part in path.parts:
+        if part in _PROTECTED_BUNDLE_NAMES or part.endswith(_PROTECTED_BUNDLE_SUFFIXES):
+            return (
+                f"Error: refusing to write inside {part} -- this is generated/managed "
+                "project state, not source to hand-edit. If a new file needs to be part "
+                "of the build, add it under Sources/<Target>/ (or the project's existing "
+                "source layout) instead; Xcode/SPM pick up new files there automatically "
+                "without any project-file edit."
+            )
+    return None
+
+
 def run_tool(call: dict, root: Path, command_timeout: float, dry_run: bool) -> str:
     """Executes one parsed tool call and returns the text to feed back to
     the model as the result. Never raises for expected failures (bad path,
@@ -174,6 +203,9 @@ def run_tool(call: dict, root: Path, command_timeout: float, dry_run: bool) -> s
             path = _safe_path(root, str(args.get("path", "")))
         except ValueError as exc:
             return f"Error: {exc}"
+        blocked = _reject_protected_bundle_write(path)
+        if blocked is not None:
+            return blocked
         content = args.get("content")
         if not isinstance(content, str):
             return 'Error: "content" must be a string (the full new file content)'
@@ -188,6 +220,9 @@ def run_tool(call: dict, root: Path, command_timeout: float, dry_run: bool) -> s
             path = _safe_path(root, str(args.get("path", "")))
         except ValueError as exc:
             return f"Error: {exc}"
+        blocked = _reject_protected_bundle_write(path)
+        if blocked is not None:
+            return blocked
         content = args.get("content")
         if not isinstance(content, str):
             return 'Error: "content" must be a string'

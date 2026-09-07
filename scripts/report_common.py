@@ -26,11 +26,25 @@ IGNORED_DIRS = {
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
     ".mypy_cache", "dist", "build", ".ai", ".run", "site-packages", ".idea",
     ".vscode",
+    # Swift Package Manager: ".build" holds compiled artifacts and checked-
+    # out dependency sources (can be large), ".swiftpm" holds local package
+    # resolution state -- neither is source a phase should read or write.
+    # Xcode's own project bundles (always named "<Project>.xcodeproj" /
+    # "<Project>.xcworkspace", so a suffix, not a literal dir name like the
+    # two above -- handled separately in collect_files) are deliberately
+    # not source either; see docs/IMPROVEMENTS_TODO.md for why an agent
+    # should never write_file into project.pbxproj directly.
+    ".build", ".swiftpm",
 }
+
+XCODE_BUNDLE_SUFFIXES = (".xcodeproj", ".xcworkspace")
 
 DEFAULT_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".json", ".md",
     ".yaml", ".yml", ".toml", ".cfg", ".ini", ".sh",
+    # Swift Package Manager source -- Package.swift is itself a ".swift" file,
+    # so no separate manifest extension is needed.
+    ".swift", ".h", ".m", ".mm", ".plist", ".entitlements", ".xcconfig",
 }
 
 # Some chat templates (seen on the "tokenizer" profile, e.g. Builder) default
@@ -78,6 +92,8 @@ def collect_files(root: Path, extensions: set[str]) -> list[Path]:
         if not path.is_file():
             continue
         if any(part in IGNORED_DIRS for part in path.parts):
+            continue
+        if any(part.endswith(XCODE_BUNDLE_SUFFIXES) for part in path.parts):
             continue
         if path.suffix not in extensions:
             continue

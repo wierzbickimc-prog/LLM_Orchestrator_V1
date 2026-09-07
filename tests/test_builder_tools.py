@@ -120,6 +120,40 @@ class RunToolPathContainmentTests(unittest.TestCase):
             self.assertIn("escapes the project root", result)
             self.assertFalse((Path(directory) / "escaped.txt").exists())
 
+    def test_write_file_into_xcodeproj_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = run_tool(
+                {"name": "write_file", "arguments": {
+                    "path": "MyApp.xcodeproj/project.pbxproj", "content": "// corrupted",
+                }},
+                root, 30.0, dry_run=False,
+            )
+            self.assertIn("refusing to write inside MyApp.xcodeproj", result)
+            self.assertFalse((root / "MyApp.xcodeproj").exists())
+
+    def test_append_file_into_swiftpm_build_dir_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = run_tool(
+                {"name": "append_file", "arguments": {"path": ".build/artifact.txt", "content": "x"}},
+                root, 30.0, dry_run=False,
+            )
+            self.assertIn("refusing to write inside .build", result)
+            self.assertFalse((root / ".build").exists())
+
+    def test_write_file_to_normal_swift_source_still_works(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = run_tool(
+                {"name": "write_file", "arguments": {
+                    "path": "Sources/MyApp/Feature.swift", "content": "struct Feature {}",
+                }},
+                root, 30.0, dry_run=False,
+            )
+            self.assertIn("Wrote", result)
+            self.assertEqual((root / "Sources/MyApp/Feature.swift").read_text(), "struct Feature {}")
+
     def test_write_file_dry_run_does_not_touch_disk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
