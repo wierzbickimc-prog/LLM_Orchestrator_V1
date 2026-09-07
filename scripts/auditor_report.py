@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +36,57 @@ from report_common import (
     resolve_ai_path,
 )
 
+# Long test output eats context fast without adding much signal past a
+# point -- keep enough to see the failure, drop the rest with a clear note.
+MAX_TEST_OUTPUT_CHARS = 8_000
+DEFAULT_TEST_TIMEOUT = 120.0
+
+
+def detect_test_command(path: Path) -> str | None:
+    """Best-effort guess at how to run this project's tests, or None if
+    nothing recognizable is found -- Auditor is one-shot and tool-free, so
+    it cannot run tests itself; this is the only way its verdict can be
+    grounded in an actual pass/fail result instead of reasoning about test
+    *source* and guessing whether it would pass. Found live, the hard way:
+    a REJECT-worthy defect (a test that genuinely failed) got a false PASS
+    because Auditor read a model's own inconclusive prose about the test
+    and mistook "the model talked itself into believing this was fixed"
+    for "this is fixed" -- it had no way to check."""
+    root = path if path.is_dir() else path.parent
+    if (root / "Package.swift").exists():
+        return "swift test"
+    has_pytest_style_tests = any(
+        p.name.startswith("test_") or p.name.endswith("_test.py")
+        for p in root.glob("*.py")
+    ) or any(root.rglob("test_*.py")) or any(root.rglob("*_test.py"))
+    if has_pytest_style_tests:
+        venv_python = root / ".venv" / "bin" / "python"
+        python = str(venv_python) if venv_python.exists() else sys.executable
+        return f"{python} -m pytest"
+    return None
+
+
+def run_test_suite(path: Path, command: str, timeout: float) -> str:
+    """Runs command in path and returns a plain-text block describing what
+    actually happened -- exit code and (possibly truncated) combined
+    output. Never raises: a timeout or a command that itself fails to
+    launch is reported as text, same as any other test result, since a
+    test suite that can't even run is itself a finding."""
+    root = path if path.is_dir() else path.parent
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=root, capture_output=True, text=True,
+            timeout=timeout,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        if len(output) > MAX_TEST_OUTPUT_CHARS:
+            output = output[:MAX_TEST_OUTPUT_CHARS] + f"\n...[truncated, {len(output)} chars total]"
+        return f"$ {command}\nExit code: {result.returncode}\n{output}"
+    except subprocess.TimeoutExpired:
+        return f"$ {command}\nTIMED OUT after {timeout}s -- treat this as a finding, not as \"tests pass\"."
+    except OSError as exc:
+        return f"$ {command}\nFailed to run: {exc}"
+
 SYSTEM_PROMPT = f"""You are a focused implementation-audit assistant. {NO_TOOLS_NOTICE} \
 Do not edit anything; you are producing an audit report, not a fix.
 
@@ -49,12 +101,23 @@ untested and materially risky change) -- not for every stylistic nit. Minor \
 residual gaps that don't rise to that bar belong in the findings below, not \
 in the verdict.
 
+If a "Test suite execution" block appears below, it is REAL output from \
+actually running the tests just now -- not something to infer from reading \
+test source. Treat it as ground truth over your own read of the test code: \
+if it shows failures or an error, your verdict must be REJECT regardless of \
+how correct the test source looks, and you must not describe behavior as \
+verified, passing, or comprehensive unless this output actually confirms \
+it. If no such block appears, no test command could be detected for this \
+project -- say so explicitly and reason about test coverage from source \
+only, without claiming to know whether the tests actually pass.
+
 After the verdict line, produce a single Markdown audit report with findings \
 ordered by severity. For each finding include a file reference, impact, and \
 evidence drawn only from the content given below. Confirm:
 - plan compliance (does the code actually do what the plan says?);
 - test coverage for the change (is there a test, and does it look like it \
-would actually catch a regression?);
+would actually catch a regression?) -- and whether the test execution result \
+above actually confirms that, not just whether the test looks plausible;
 - error handling for the new/changed behavior;
 - unintended scope (anything changed that the plan didn't call for);
 - network exposure: if this change alters what a server binds to by default \
@@ -96,6 +159,16 @@ def main() -> int:
         help="restrict to this extension (repeatable); default is a built-in source/text list",
     )
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--test-command", default=None,
+        help="override the auto-detected test command (e.g. 'swift test'); "
+        "auto-detects pytest-style tests or a Package.swift by default",
+    )
+    parser.add_argument(
+        "--skip-test-run", action="store_true",
+        help="don't actually run the test suite -- reason from source only, same as before this option existed",
+    )
+    parser.add_argument("--test-timeout", type=float, default=DEFAULT_TEST_TIMEOUT)
     parser.add_argument("--dry-run", action="store_true", help="collect and report file stats without calling the model")
     args = parser.parse_args()
     if args.plan is None:
@@ -142,6 +215,17 @@ def main() -> int:
     if args.dry_run:
         return 0
 
+    test_block = ""
+    if not args.skip_test_run:
+        command = args.test_command or detect_test_command(args.path)
+        if command:
+            print(f"Running test suite: {command}")
+            test_output = run_test_suite(args.path, command, args.test_timeout)
+            print(test_output)
+            test_block = f"Test suite execution (ran just now, real output):\n{test_output}\n\n"
+        else:
+            print("No test command detected (no Package.swift, no test_*.py/*_test.py found) -- skipping.")
+
     user_content = (
         f"Implementation plan ({args.plan}):\n{plan}\n\n"
         + (f"Additional note from the requester:\n{args.task}\n\n" if args.task else "")
@@ -151,6 +235,7 @@ def main() -> int:
             f"unintended scope: {', '.join(touched)}\n\n"
             if touched else ""
         )
+        + test_block
         + f"Current repository files:\n{context}"
         + describe_skipped(skipped)
     )
