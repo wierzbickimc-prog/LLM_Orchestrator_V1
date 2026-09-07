@@ -101,7 +101,7 @@ def model_command(
         "--paged-kv-quantization",
         str(role["kv_quantization"]),
         "--ssd-session-cache",
-        "on",
+        str(role.get("ssd_session_cache", "off")),
         "--ssd-session-cache-max-size",
         str(role["ssd_cache"]),
         "--ssd-session-cache-min-prefix-tokens",

@@ -17,12 +17,26 @@ from pathlib import Path
 
 TOOL_BLOCK_RE = re.compile(r"```tool\s*\n(.*?)```", re.DOTALL)
 
+# Recovery for a tool-call-shaped JSON object that appears with its ```tool
+# fence stripped entirely (not truncated -- just never fenced), observed in
+# a live run: the response was exactly `tool\n{"name": "read_file", ...}`,
+# no backticks anywhere, and the model's own next turn said "I see my tool
+# blocks aren't being registered." Without this, extract_tool_call finds no
+# fence, sees no "```tool" substring either, and returns None -- read as
+# "the model is done" -- ending the session after zero real work with this
+# stray text saved as the final report.
+_BARE_TOOL_JSON_RE = re.compile(r'\{\s*"name"\s*:')
+
 # Long command output eats context fast (e.g. a verbose test run) without
 # adding much signal past a point -- keep enough to see the failure, drop
 # the rest with a clear note instead of silently truncating.
 MAX_COMMAND_OUTPUT_CHARS = 8_000
 
-VALID_TOOLS = {"read_file", "write_file", "run_command", "append_file"}
+VALID_TOOLS = {"read_file", "write_file", "run_command", "append_file", "ask_question"}
+# ask_question is intercepted in builder_agent.run_agent before it ever
+# reaches run_tool() below -- answering it means blocking on real input,
+# which run_tool has no way to do (it's a pure request/response function
+# with no access to the agent loop's on_chunk or stdin handling).
 
 
 class ToolCallParseError(Exception):
@@ -30,6 +44,28 @@ class ToolCallParseError(Exception):
     this back to the model as an error to correct, rather than crashing --
     the whole point of parsing this ourselves is to recover from exactly
     this instead of stalling the way mtplx's bridge did on malformed XML."""
+
+
+def _try_bare_json_tool_call(response_text: str) -> dict | None:
+    """Looks for a tool-call-shaped JSON object with no ```tool fence around
+    it at all -- see _BARE_TOOL_JSON_RE's comment for why this exists. Uses
+    a real JSON decoder positioned at the first plausible start rather than
+    a brace-matching regex, so it isn't confused by braces inside string
+    values (e.g. write_file's own "content"). Returns None (not an error)
+    for anything that doesn't cleanly decode into a valid call -- this is a
+    best-effort recovery, not a replacement for the real fence."""
+    match = _BARE_TOOL_JSON_RE.search(response_text)
+    if match is None:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(response_text, match.start())
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or "name" not in obj or "arguments" not in obj:
+        return None
+    if obj["name"] not in VALID_TOOLS or not isinstance(obj["arguments"], dict):
+        return None
+    return obj
 
 
 def extract_tool_call(response_text: str) -> dict | None:
@@ -54,6 +90,9 @@ def extract_tool_call(response_text: str) -> dict | None:
                 "append_file calls for the rest, each small enough to fit in a "
                 "single response."
             )
+        bare = _try_bare_json_tool_call(response_text)
+        if bare is not None:
+            return bare
         return None
     raw = match.group(1).strip()
     try:

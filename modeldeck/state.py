@@ -202,6 +202,19 @@ def _role(
         "ram_cache_per_session": "12G",
         "ram_cache_entries": 8,
         "ssd_cache": "10G",
+        # Off by design, not a placeholder -- confirmed empirically that
+        # mtplx's SSD/cold-tier session cache (~/.mtplx/session-bank) is
+        # global and content-addressed, not scoped per conversation or per
+        # process. Scout/Planner/Builder/Auditor/Renovator all read
+        # overlapping repository files with near-identical formatting, so a
+        # brand-new request can get an "exact_prefix" match against a
+        # completely unrelated earlier conversation's cached tokens and
+        # silently continue from someone else's context -- reproduced live:
+        # a fresh Planner call inherited a 35,943-token prefix from an
+        # unrelated prior Builder/Renovator session and stopped after 53
+        # garbled tokens. RAM-only session reuse (this process's own
+        # lifetime, cleared on every relaunch) doesn't have this problem.
+        "ssd_session_cache": "off",
         "fan_mode": "smart",
         "profile": "turbo",
         "prefill_chunk_tokens": 2048,

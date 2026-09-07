@@ -98,6 +98,31 @@ class RunAgentTests(unittest.TestCase):
             self.assertIn("Done", report)
             self.assertNotIn("MTPLX", report)
 
+    def test_ask_question_blocks_on_input_and_feeds_answer_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses = _canned_responses(
+                '```tool\n{"name": "ask_question", '
+                '"arguments": {"question": "Token or IP allowlist?", "options": ["token", "allowlist"]}}\n```',
+                "Done. Used a token per the answer.",
+            )
+            chunks: list[str] = []
+            with patch.object(builder_agent, "stream_chat", responses), \
+                 patch("builtins.input", return_value="token") as fake_input:
+                report, steps, touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=chunks.append,
+                )
+            fake_input.assert_called_once()
+            self.assertEqual(steps, 2)
+            self.assertIn("Done.", report)
+            self.assertEqual(touched, [])
+            transcript = "".join(chunks)
+            self.assertIn("ASK_QUESTION", transcript)
+            self.assertIn("Token or IP allowlist?", transcript)
+            self.assertIn("answered: token", transcript)
+
     def test_max_steps_is_a_hard_cap_not_a_crash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

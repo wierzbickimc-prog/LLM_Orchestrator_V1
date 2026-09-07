@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -45,7 +46,7 @@ from .secrets import get_openai_api_key, set_openai_api_key
 from .state import activate_local, activate_planner, load_state, sampling_preset, save_state
 
 sys.path.insert(0, str(PROJECT_DIR / "scripts"))
-from report_common import parse_verdict  # noqa: E402
+from report_common import parse_verdict, resolve_ai_path  # noqa: E402
 
 
 # Scripts run against the router for each phase -- scout/planner/auditor are
@@ -96,6 +97,7 @@ class Bridge(QObject):
 class ReportBridge(QObject):
     finished = Signal(str, bool, str)  # phase, success, report content or error text
     chunk = Signal(str, str)  # phase, text piece as it streams in
+    ask_question = Signal(str, str)  # phase, JSON {"question": ..., "options": [...] | None}
 
 
 PIPELINE_ORDER: tuple[str, ...] = ("scout", "planner", "builder", "auditor")
@@ -105,6 +107,16 @@ PIPELINE_ORDER: tuple[str, ...] = ("scout", "planner", "builder", "auditor")
 # when the loop actually fires.
 STATUS_PHASES: tuple[str, ...] = PIPELINE_ORDER + ("renovator",)
 MAX_RENOVATOR_RETRIES = 1
+# What must already exist under <path>/.ai/ to start a run at this phase
+# instead of from Scout -- e.g. resuming at Builder after a Stop or a
+# rejected-twice Auditor verdict, without redoing Scout/Planner. Scout has
+# no prerequisite: it scans the target fresh.
+REQUIRED_ARTIFACT_FOR_START: dict[str, str] = {
+    "scout": "",
+    "planner": "scout-report.md",
+    "builder": "implementation-plan.md",
+    "auditor": "implementation-plan.md",
+}
 
 
 class PipelinePanel(QGroupBox):
@@ -132,6 +144,19 @@ class PipelinePanel(QGroupBox):
         self.task_field.setPlaceholderText("what the change/investigation is for")
         self.task_field.setMinimumHeight(140)
         layout.addWidget(self.task_field)
+
+        # Lets a run resume after a stop -- a rejected Auditor verdict that
+        # used up its retry, a manual Stop click, or a crash -- without
+        # redoing already-completed (and possibly expensive) earlier phases.
+        # Starting anywhere but Scout requires that phase's input artifact
+        # to already exist on disk (checked in MainWindow._start_pipeline).
+        start_row = QHBoxLayout()
+        start_row.addWidget(QLabel("Start from"))
+        self.start_phase = QComboBox()
+        for phase in PIPELINE_ORDER:
+            self.start_phase.addItem(phase.title(), phase)
+        start_row.addWidget(self.start_phase, 1)
+        layout.addLayout(start_row)
 
         run_row = QHBoxLayout()
         self.full_suite_button = QPushButton("Run Full Suite")
@@ -442,8 +467,12 @@ class MainWindow(QMainWindow):
         self.report_bridge = ReportBridge()
         self.report_bridge.finished.connect(self._report_finished)
         self.report_bridge.chunk.connect(self._report_chunk)
+        self.report_bridge.ask_question.connect(self._on_ask_question)
         self.report_start_times: dict[str, float] = {}
         self.report_processes: dict[str, subprocess.Popen] = {}
+        # phase -> (Event the worker thread blocks on, single-item list the
+        # main-thread dialog handler drops the answer into before setting it)
+        self._pending_answers: dict[str, tuple[threading.Event, list[str]]] = {}
         self.pipeline_mode: str | None = None
         self.pipeline_task: str = ""
         self.pipeline_path: str = ""
@@ -451,6 +480,13 @@ class MainWindow(QMainWindow):
         self.pipeline_current_phase: str | None = None
         self.pipeline_renovator_retries: int = 0
         self._pipeline_resident_role: str | None = None
+        # phase -> last-measured prefill_tok_s from /metrics (populated only
+        # after a request completes) -- carried forward to estimate an ETA
+        # for the *next* request's prefill phase, since mtplx's live /v1/
+        # mtplx/flight endpoint reports prompt_tokens but no live prefill
+        # progress or rate (confirmed empirically: "prefill" stays null
+        # throughout an active prefill, not just before/after it).
+        self._last_prefill_rate: dict[str, float] = {}
         self.report_timer = QTimer(self)
         self.report_timer.timeout.connect(self._tick_report_status)
         self.report_timer.start(1000)
@@ -617,7 +653,14 @@ class MainWindow(QMainWindow):
         live_layout.addWidget(self.live_tail)
         layout.addWidget(live_box)
 
-        metric_group = QGroupBox("Live telemetry")
+        # Named for what it actually is, not what it sounds like: /metrics'
+        # "latest" only updates once a request finishes, so every field here
+        # shows the *previous* completed request's numbers and goes stale
+        # (not blank, just frozen) for the entire duration of whatever's
+        # running now. "Current request" above is the one that's genuinely
+        # live -- this one used to also be labeled "Live telemetry", which
+        # reads as broken the whole time something's actually in flight.
+        metric_group = QGroupBox("Last completed request")
         metric_layout = QGridLayout(metric_group)
         self.cards: dict[str, MetricCard] = {}
         for index, (key, label) in enumerate(
@@ -851,20 +894,36 @@ class MainWindow(QMainWindow):
     def _start_pipeline(self, mode: str) -> None:
         path = self.pipeline_panel.path_field.text().strip()
         task = self.pipeline_panel.task_field.toPlainText().strip()
+        start_phase = str(self.pipeline_panel.start_phase.currentData())
         if not path:
             QMessageBox.information(self, "Path required", "Enter a file or directory to scan.")
             return
-        if not task:
+        if start_phase == "scout" and not task:
             QMessageBox.information(self, "Task required", "Describe what this change/investigation is for.")
             return
+
+        required = REQUIRED_ARTIFACT_FOR_START.get(start_phase, "")
+        if required:
+            required_path = resolve_ai_path(Path(path), required)
+            if not required_path.exists():
+                QMessageBox.warning(
+                    self, "Missing prerequisite",
+                    f"Starting at {start_phase.title()} needs {required_path} to already exist "
+                    f"(normally written by an earlier phase). Run from Scout instead, or point "
+                    f"Path at a location where that file is already present.",
+                )
+                return
 
         self.pipeline_mode = mode
         self.pipeline_task = task
         self.pipeline_path = path
-        self.pipeline_queue = list(PIPELINE_ORDER)
+        start_index = PIPELINE_ORDER.index(start_phase)
+        self.pipeline_queue = list(PIPELINE_ORDER[start_index:])
         self.pipeline_renovator_retries = 0
         self._pipeline_resident_role = None
         self.pipeline_panel.reset_status()
+        for skipped_phase in PIPELINE_ORDER[:start_index]:
+            self.pipeline_panel.phase_status[skipped_phase].setText(f"{skipped_phase.title()}: skipped (resumed)")
         self.pipeline_panel.output.clear()
         self.pipeline_panel.full_suite_button.setEnabled(False)
         self.pipeline_panel.step_wise_button.setEnabled(False)
@@ -906,6 +965,15 @@ class MainWindow(QMainWindow):
         self.pipeline_panel.phase_status[phase].setText(f"{phase.title()}: stopping…")
         self.pipeline_panel.stop_button.setEnabled(False)
         process.terminate()
+        # If the worker thread is blocked in _handle_ask_question waiting on
+        # an answer (not on reading stdout), terminate() alone would never
+        # unblock it -- release it here with an empty answer so it can
+        # notice the dead process and finish instead of hanging forever.
+        event, box = self._pending_answers.pop(phase, (None, None))
+        if box is not None:
+            box.append("")
+        if event is not None:
+            event.set()
         # No further bookkeeping needed here: the worker thread's read loop
         # sees stdout close, process.wait() returns a nonzero code, and
         # _pipeline_worker's existing failure path (report_bridge.finished
@@ -945,6 +1013,7 @@ class MainWindow(QMainWindow):
             process = subprocess.Popen(
                 [str(python), str(script_path), *args],
                 cwd=PROJECT_DIR,
+                stdin=subprocess.PIPE,  # builder_agent.py's ask_question blocks reading a line here
                 stdout=subprocess.PIPE,
                 # Combined into stdout so we only have one pipe to drain --
                 # the script's progress lines and the model's streamed text
@@ -961,12 +1030,18 @@ class MainWindow(QMainWindow):
         self.report_processes[phase] = process
         collected: list[str] = []
         assert process.stdout is not None
+        line_buffer = ""
         while True:
             piece = process.stdout.read(64)
             if not piece:
                 break
             collected.append(piece)
             self.report_bridge.chunk.emit(phase, piece)
+            line_buffer += piece
+            while "\n" in line_buffer:
+                line, line_buffer = line_buffer.split("\n", 1)
+                if line.startswith("[ASK_QUESTION] "):
+                    self._handle_ask_question(phase, process, line[len("[ASK_QUESTION] "):])
         returncode = process.wait()
         output_text = "".join(collected)
 
@@ -990,6 +1065,59 @@ class MainWindow(QMainWindow):
             )
             return
         self.report_bridge.finished.emit(phase, True, content)
+
+    def _handle_ask_question(self, phase: str, process: subprocess.Popen, payload: str) -> None:
+        """Runs on the pipeline worker thread. Hands the question to the UI
+        thread via a signal (PySide6 queues cross-thread signals onto the
+        receiving QObject's own thread automatically) and blocks this
+        thread -- not the UI -- until _on_ask_question sets the event after
+        the person answers the dialog."""
+        answer_event = threading.Event()
+        answer_box: list[str] = []
+        self._pending_answers[phase] = (answer_event, answer_box)
+        self.report_bridge.ask_question.emit(phase, payload)
+        answer_event.wait()
+        answer = answer_box[0] if answer_box else ""
+        assert process.stdin is not None
+        try:
+            process.stdin.write(answer + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass  # process already gone (e.g. stopped while waiting) -- nothing to feed the answer to
+
+    def _on_ask_question(self, phase: str, payload: str) -> None:
+        """Runs on the UI thread. Shows a blocking dialog, then unblocks
+        _handle_ask_question's wait on the pipeline worker thread."""
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            data = {"question": payload, "options": None}
+        question = str(data.get("question") or "(no question text)")
+        options = data.get("options")
+        panel = self.pipeline_panel
+        panel.output.appendPlainText(f"\n--- {phase.upper()} IS ASKING ---\n{question}\n")
+
+        answer = ""
+        title = f"{phase.title()} needs a decision"
+        if isinstance(options, list) and options:
+            choice, ok = QInputDialog.getItem(
+                self, title, question, [str(option) for option in options], 0, False,
+            )
+            answer = choice if ok else str(options[0])
+            if not ok:
+                panel.output.appendPlainText(
+                    f"(dialog dismissed -- defaulting to {answer!r} so the run can continue)\n"
+                )
+        else:
+            text, ok = QInputDialog.getText(self, title, question)
+            answer = text if ok else ""
+        panel.output.appendPlainText(f"--- answered: {answer} ---\n")
+
+        event, box = self._pending_answers.pop(phase, (None, None))
+        if box is not None:
+            box.append(answer)
+        if event is not None:
+            event.set()
 
     def _report_chunk(self, phase: str, piece: str) -> None:
         panel = self.pipeline_panel
@@ -1237,8 +1365,13 @@ class MainWindow(QMainWindow):
         except Exception:
             self._clear_metrics("Waiting for local model…")
             return
-        self._refresh_flight(base)
         latest = envelope.get("latest") or {}
+        if latest.get("prefill_tok_s"):
+            # Carried forward so a later request's live prefill phase (which
+            # itself reports no rate -- see _refresh_flight) has something
+            # to estimate an ETA from.
+            self._last_prefill_rate[phase] = float(latest["prefill_tok_s"])
+        self._refresh_flight(base, phase)
         self.cards["prefill"].value.setText(self._rate(latest.get("prefill_tok_s")))
         self.cards["decode"].value.setText(self._rate(latest.get("decode_tok_s")))
         self.cards["ttft"].value.setText(self._seconds(latest.get("ttft_s")))
@@ -1291,12 +1424,20 @@ class MainWindow(QMainWindow):
         self.live_status.setText("Idle -- no request in flight")
         self.live_tail.setPlainText("")
 
-    def _refresh_flight(self, base: str) -> None:
+    def _refresh_flight(self, base: str, role_phase: str) -> None:
         """Live in-progress request status from mtplx's own flight log --
         this is what actually updates during prefill/decode, unlike
         /metrics (whose "latest" stays null until a request finishes). Best
         effort: an older mtplx build without this endpoint just shows Idle,
-        same as no request being in flight."""
+        same as no request being in flight.
+
+        During an active prefill, mtplx's own numbers are of no help for an
+        ETA: "prefill" is null and tps_now/tps_avg are both 0 for the whole
+        phase (confirmed empirically, not documented) -- prompt_tokens is
+        the only thing known up front. So the estimate here is deliberately
+        approximate: prompt_tokens divided by the *last completed request's*
+        prefill_tok_s for this role (from refresh_metrics), labeled as an
+        estimate so it isn't mistaken for a live measurement."""
         try:
             flight = fetch_json(f"{base}/v1/mtplx/flight", timeout=0.3)
         except Exception:
@@ -1309,16 +1450,25 @@ class MainWindow(QMainWindow):
             self.live_tail.setPlainText("")
             return
         request = active[0]
-        phase = str(request.get("phase") or "?")
+        request_phase = str(request.get("phase") or "?")
         tps_now = request.get("tps_now")
         tps_avg = request.get("tps_avg")
         elapsed = request.get("elapsed_s")
         prompt_tokens = int(request.get("prompt_tokens") or 0)
         gen_tokens = int(request.get("gen_tokens") or 0)
+
+        eta_text = ""
+        if request_phase == "prefill":
+            known_rate = self._last_prefill_rate.get(role_phase)
+            if known_rate:
+                eta_text = f"  ·  est. {prompt_tokens / known_rate:.0f}s remaining (from last request's {known_rate:.0f} tok/s)"
+            else:
+                eta_text = "  ·  no prior request this session to estimate a prefill ETA from"
+
         self.live_status.setText(
-            f"● {phase}  ·  {self._rate(tps_now)} now (avg {self._rate(tps_avg)})  ·  "
+            f"● {request_phase}  ·  {self._rate(tps_now)} now (avg {self._rate(tps_avg)})  ·  "
             f"{prompt_tokens:,} prompt tok  ·  {gen_tokens:,} generated  ·  "
-            f"{self._seconds(elapsed)} elapsed"
+            f"{self._seconds(elapsed)} elapsed{eta_text}"
         )
         tail = request.get("tail")
         if isinstance(tail, str) and tail:

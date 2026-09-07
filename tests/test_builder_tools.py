@@ -41,6 +41,29 @@ class ExtractToolCallTests(unittest.TestCase):
         self.assertIn("cut off", str(ctx.exception))
         self.assertIn("append_file", str(ctx.exception))
 
+    def test_bare_json_tool_call_with_no_fence_is_recovered(self) -> None:
+        # Observed in a live run: the fence markers were stripped entirely
+        # (not truncated -- there's no "```tool" substring anywhere), leaving
+        # a bare tool-call-shaped JSON object. Without recovery this reads
+        # as "no tool call at all" (done), ending the session after zero
+        # real work.
+        text = 'tool\n{"name": "read_file", "arguments": {"path": "devices.py"}}'
+        call = extract_tool_call(text)
+        self.assertEqual(call, {"name": "read_file", "arguments": {"path": "devices.py"}})
+
+    def test_bare_json_tool_call_with_content_braces_still_parses(self) -> None:
+        # A real JSON decoder (not a brace-matching regex) must not be
+        # confused by braces inside a string value like write_file's content.
+        text = 'tool\n{"name": "write_file", "arguments": {"path": "a.py", "content": "def f():\\n    return {}"}}'
+        call = extract_tool_call(text)
+        self.assertEqual(call["name"], "write_file")
+        self.assertEqual(call["arguments"]["content"], "def f():\n    return {}")
+
+    def test_bare_json_with_unknown_tool_name_is_not_recovered(self) -> None:
+        # Guards against false-positive recovery of unrelated JSON that
+        # happens to start with "name" -- only a real tool name counts.
+        self.assertIsNone(extract_tool_call('Example config: {"name": "not_a_tool", "arguments": {}}'))
+
     def test_missing_arguments_key_is_rejected(self) -> None:
         with self.assertRaises(ToolCallParseError):
             extract_tool_call('```tool\n{"name": "read_file"}\n```')

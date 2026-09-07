@@ -55,6 +55,20 @@ and nothing meaningful outside it. Available actions:
 ```tool
 {{"name": "run_command", "arguments": {{"command": "shell command, e.g. pytest"}}}}
 ```
+```tool
+{{"name": "ask_question", "arguments": {{"question": "the decision you need", "options": ["A", "B"]}}}}
+```
+
+ask_question pauses this session and puts your question in front of the \
+person who launched this run -- "options" is optional (omit it for a \
+free-text answer). Use it sparingly, only when the plan is genuinely silent \
+on a decision AND guessing wrong would be costly or hard to undo (e.g. an \
+irreversible destructive command, a choice between two incompatible designs \
+the plan didn't resolve). For anything else -- naming, minor structure, \
+small ambiguities a competent engineer would just resolve -- use your best \
+judgment and note the decision in your final report instead of asking. \
+Every ask_question call costs the person's attention; don't spend it on \
+things you can reasonably decide yourself.
 
 All paths are relative to the project root and must stay within it. \
 write_file replaces the entire file -- always read a file before changing \
@@ -136,6 +150,27 @@ def run_agent(
 
         if call is None:
             return response, step, sorted(touched)
+
+        if call["name"] == "ask_question":
+            # Handled here, not in builder_tools.run_tool, because answering
+            # requires blocking on real input -- print a marker line the
+            # caller can recognize (a human at a terminal, or the GUI
+            # watching this subprocess's stdout to pop a dialog and write
+            # the answer to stdin) and read one line back.
+            question = str(call["arguments"].get("question") or "")
+            options = call["arguments"].get("options")
+            marker = json.dumps({
+                "question": question,
+                "options": options if isinstance(options, list) else None,
+            })
+            on_chunk(f"\n[ASK_QUESTION] {marker}\n")
+            answer = input().strip()
+            on_chunk(f"[answered: {answer}]\n")
+            messages.append({
+                "role": "user",
+                "content": f"The person running this session answered: {answer}",
+            })
+            continue
 
         result = run_tool(call, root, command_timeout, dry_run)
         on_chunk(f"\n[{call['name']} -> {len(result)} chars]\n")
