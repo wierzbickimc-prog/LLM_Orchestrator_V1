@@ -3,15 +3,18 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from report_common import (  # noqa: E402
+    DEFAULT_CHAR_BUDGET,
     DEFAULT_EXTENSIONS,
     collect_files,
     describe_skipped,
     looks_like_failed_tool_call,
+    char_budget_for_role,
     parse_builder_accuracy,
     parse_verdict,
     referenced_files,
@@ -266,3 +269,78 @@ class InterleaveByAreaTests(unittest.TestCase):
             found = collect_files(root, {".py"})
         aaa = [p.name for p in found if p.parent.name == "aaa"]
         self.assertEqual(aaa, sorted(aaa))
+
+
+class CharBudgetForRoleTests(unittest.TestCase):
+    """char_budget_for_role must never touch or care about the operator's
+    real config file -- these all point MODEL_DECK_CONFIG_DIR at a throwaway
+    directory. (See test_web.py's isolated_config fixture for what happens
+    when a test in this codebase forgets to.)"""
+
+    def _state_dir(self, tmp_path: Path, state: dict) -> None:
+        import json as _json
+        (tmp_path / "state.json").write_text(_json.dumps(state))
+
+    def test_derives_from_the_roles_context_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._state_dir(Path(directory), {
+                "planner": {"kind": "local"},
+                "roles": {"scout": {"context_window": 131_072}},
+            })
+            with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
+                budget = char_budget_for_role("scout")
+        expected = int((131_072 - 34_000) * 3.7)
+        self.assertEqual(budget, expected)
+
+    def test_cloud_planner_falls_back_rather_than_using_the_unused_local_role(self) -> None:
+        # roles["planner"] still has a context_window even when the cloud
+        # backend is active -- it's just not the model actually serving the
+        # request, so deriving from it would be a guess, not a measurement.
+        with tempfile.TemporaryDirectory() as directory:
+            self._state_dir(Path(directory), {
+                "planner": {"kind": "openai"},
+                "roles": {"planner": {"context_window": 131_072}},
+            })
+            with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
+                budget = char_budget_for_role("planner")
+        self.assertEqual(budget, DEFAULT_CHAR_BUDGET)
+
+    def test_unknown_phase_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._state_dir(Path(directory), {"planner": {}, "roles": {}})
+            with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
+                budget = char_budget_for_role("does-not-exist")
+        self.assertEqual(budget, DEFAULT_CHAR_BUDGET)
+
+    def test_zero_context_window_falls_back(self) -> None:
+        # load_state deep-merges onto default_state(), so a truly missing
+        # key would inherit the real default -- this has to set the field
+        # explicitly to exercise the "can't derive anything useful" path.
+        with tempfile.TemporaryDirectory() as directory:
+            self._state_dir(Path(directory), {
+                "planner": {"kind": "local"},
+                "roles": {"scout": {"context_window": 0}},
+            })
+            with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
+                budget = char_budget_for_role("scout")
+        self.assertEqual(budget, DEFAULT_CHAR_BUDGET)
+
+    def test_a_missing_state_file_still_derives_correctly(self) -> None:
+        # load_state() returns default_state() wholesale when state.json is
+        # absent, and that default is itself a real, valid context_window --
+        # so this is NOT a fallback case. A report script running before the
+        # GUI has ever saved a config should still get a correctly derived
+        # budget, not silently degrade to the stale constant.
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"MODEL_DECK_CONFIG_DIR": directory}):
+                budget = char_budget_for_role("scout")
+        self.assertNotEqual(budget, DEFAULT_CHAR_BUDGET)
+        self.assertGreater(budget, 0)
+
+    def test_an_exception_resolving_state_falls_back_instead_of_raising(self) -> None:
+        # A report script must be able to run even if state.json is
+        # corrupt or modeldeck.state misbehaves -- getting the budget right
+        # is an optimization, not a precondition for the phase to work.
+        with patch("modeldeck.state.load_state", side_effect=RuntimeError("boom")):
+            budget = char_budget_for_role("scout")
+        self.assertEqual(budget, DEFAULT_CHAR_BUDGET)

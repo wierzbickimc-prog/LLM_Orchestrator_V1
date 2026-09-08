@@ -111,6 +111,46 @@ the way it is.
 
 ## Done
 
+- **Char budget now derives from the role's actual context_window, and
+  report artifacts no longer overwrite their own history.** Two fixes to
+  the same class of problem found analyzing the two most recent runs:
+  DEFAULT_CHAR_BUDGET was a hand-typed constant that went stale for weeks
+  after context_window moved 100k -> 131,072, and separately, a REJECT'd
+  audit's original findings were unrecoverable by the time anyone went
+  looking, because the re-audit had already overwritten them at the same
+  fixed path. `char_budget_for_role(phase)` (scripts/report_common.py)
+  reads the live role's context_window and derives the budget from it
+  (~3.7 chars/token, 34k tokens reserved for prompt+response), falling back
+  to the constant only when the role can't be resolved -- an unknown
+  phase, or a cloud-backed Planner, whose real context window this app
+  doesn't track and would be a guess to derive from roles["planner"] while
+  that role sits unused. `write_report(path, content)` archives whatever
+  was already at a fixed artifact path (e.g. .ai/audit-report.md) into
+  .ai/history/ before overwriting it, so every phase's write still lands
+  at the exact path everything downstream expects, but a real, diffable
+  run history now accumulates instead of erasing itself. Wired into all
+  five report-writing sites (scout/planner/auditor/builder/renovator).
+
+- **A from-Planner rerun of the remote-Tailnet-access plan crashed Builder
+  on turn 9 of its 80-turn budget, not from running out of turns.**
+  Diagnosed from .run/builder.log: the model got stuck re-attempting a
+  large write_file for modeldeck/state.py after earlier attempts broke on
+  JSON escaping ("the tool block was not valid JSON"), spiraled into a
+  798-second, 17,329-token generation, tripped mtplx's own repetition-
+  holdback safety net (the same degenerate-repetition signature hit
+  earlier trying kv_quantization="off" on Scout), and was killed by
+  mtplx's stream-stall watchdog (idle >300s). builder-report.md ended up
+  0 bytes -- the process never reached a finishing move, plain-text or
+  otherwise -- so the resulting REJECT/0% wasn't "wrote code, didn't test
+  it," it was "wrote almost nothing, in one file, then choked." Renovator
+  then inherited what was effectively the whole original plan rather than
+  a narrow fix list, and correctly hit its own 80-step cap without
+  finishing either. Nothing to fix here beyond what already shipped (the
+  test-gate language in builder_agent.py's SYSTEM_PROMPT_TEMPLATE); it's a
+  real failure mode worth recognizing on sight next time a run reports a
+  suspiciously low turn count alongside a suspiciously low accuracy score.
+
+
 - **Scout was reading roughly half the tree, and the missing half was
   always the same half.** `build_context` fills its char budget in list
   order and drops the remainder; `collect_files` returned plain

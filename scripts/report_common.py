@@ -10,27 +10,88 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 DEFAULT_ROUTER_URL = "http://127.0.0.1:8100/v1"
 
-# Sized against the 131,072-token context window the roles actually run
-# (modeldeck/state.py), keeping the same proportional headroom the old
-# 260k-char number reserved under the 100k window it was written for: ~360k
-# chars is roughly 90-97k tokens of code-heavy text, leaving 30-40k for the
-# system prompt and the model's own report. This was NOT updated when the
-# window went 100k -> 128k, so for a while every phase was leaving a third
-# of its context unused while silently dropping files over the old budget.
+# Fallback only -- char_budget_for_role() below derives the real number from
+# whichever role is actually running. This constant is what's used when that
+# derivation can't be done (an unresolvable role, a cloud-backed phase whose
+# context window this app doesn't track). Sized against the 131,072-token
+# window the local roles run at the time this was last hand-tuned, keeping
+# the same proportional headroom the original 260k-char number reserved
+# under the 100k window it was written for.
 #
-# Raising this is not free: a bigger context costs prefill time on every
-# request whether or not it's filled, and Scout is already the slowest
-# phase. Don't raise it further without a measured reason -- the fix for
-# "the tree doesn't fit" is usually excluding what doesn't belong in the
-# scan (see IGNORED_DIRS), not buying more room.
+# This constant is exactly the failure mode char_budget_for_role exists to
+# prevent: it was written once for a 100k window and silently went stale
+# when the roles moved to 131,072, quietly dropping files over a budget that
+# no longer matched reality until that drift was noticed and fixed by hand.
+# A fallback is still needed -- keep it, but don't expect it to stay
+# accurate; that's the derived function's job now.
 DEFAULT_CHAR_BUDGET = 360_000
+
+# Conservative estimate for code-heavy text -- used only to convert the
+# token headroom below into a character count, since build_context reads
+# files directly and has no tokenizer to count with. Erring low (an
+# overestimate of chars-per-token would let more file content in than
+# actually fits) is what makes this a fine approximation rather than a real
+# risk of overflowing the context window.
+CHARS_PER_TOKEN = 3.7
+
+# Reserved for the system prompt and the model's own response, on top of
+# whatever the file content consumes. Not tuned per-phase: Scout, Planner,
+# and Auditor's system prompts are all a few thousand tokens, and their
+# reports run a few thousand more -- 34k is comfortable headroom for any of
+# them without giving back so much of the window that raising context_window
+# stops mattering.
+RESPONSE_HEADROOM_TOKENS = 34_000
+
+
+def char_budget_for_role(phase: str) -> int:
+    """The file-content character budget derived from the *actual*
+    context_window of the local role backing `phase`, so raising the window
+    in the Deck tab raises the budget along with it -- this is the fix for
+    the exact drift DEFAULT_CHAR_BUDGET above describes: a hand-typed number
+    sized for one window value, silently wrong after the window changed and
+    nothing forced it to be revisited.
+
+    Falls back to DEFAULT_CHAR_BUDGET when the role can't be resolved: an
+    unknown phase, modeldeck not importable (these scripts are meant to run
+    standalone), or -- for "planner" specifically -- the planner currently
+    backed by a cloud model rather than roles["planner"]. A cloud model's
+    real context window isn't tracked anywhere in this app, so deriving a
+    number from the *local* planner role while it sits unused would be a
+    guess dressed up as a measurement; DEFAULT_CHAR_BUDGET is the honest
+    answer there, not a bug to fix later.
+
+    Getting this number right is an optimization, not a requirement for the
+    phase to run -- any exception here is swallowed and treated as "use the
+    fallback," never as a reason to fail the run."""
+    try:
+        project_dir = Path(__file__).resolve().parents[1]
+        if str(project_dir) not in sys.path:
+            sys.path.insert(0, str(project_dir))
+        from modeldeck.state import load_state
+
+        state = load_state()
+        if phase == "planner" and (state.get("planner") or {}).get("kind") != "local":
+            return DEFAULT_CHAR_BUDGET
+        role = (state.get("roles") or {}).get(phase) or {}
+        context_window = int(role.get("context_window") or 0)
+        if context_window <= 0:
+            return DEFAULT_CHAR_BUDGET
+        available_tokens = context_window - RESPONSE_HEADROOM_TOKENS
+        if available_tokens <= 0:
+            return DEFAULT_CHAR_BUDGET
+        return int(available_tokens * CHARS_PER_TOKEN)
+    except Exception:
+        return DEFAULT_CHAR_BUDGET
 
 IGNORED_DIRS = {
     ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
@@ -93,6 +154,41 @@ class ReportError(Exception):
     """Raised for expected, user-facing failures (missing artifact, no
     matching files, unreachable router) -- callers print .args[0] and exit 1
     rather than showing a traceback."""
+
+
+def write_report(path: Path, content: str) -> None:
+    """Writes content to path, archiving whatever was there first into
+    path.parent/history/.
+
+    Every phase writes to the same fixed filename every run
+    (.ai/audit-report.md, etc.) because everything downstream -- the next
+    phase's REQUIRED_ARTIFACT_FOR_START check, resolve_ai_path callers,
+    a human rereading a report -- expects that exact path to hold the
+    current run's result. That fixed-path contract is also what makes a
+    re-run destructive: an audit that REJECTs and triggers a Renovator
+    repair pass gets overwritten by its own re-audit, so by the time
+    anyone goes looking, the fix list the Renovator actually worked from
+    is gone -- confirmed live: a re-audit at 18:09 was the only surviving
+    copy, and the original REJECT that produced the Renovator's fix list
+    had already been overwritten by the time it was read.
+
+    Archiving on write keeps the fixed path working for every existing
+    consumer while leaving a real, diffable run history behind. Uses the
+    *previous* file's own mtime for the archive's timestamp, not "now" --
+    so the archived name reflects when that version was actually produced,
+    which is the number worth comparing runs by."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        history_dir = path.parent / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+        archived = history_dir / f"{path.stem}_{stamp}{path.suffix}"
+        suffix = 2
+        while archived.exists():
+            archived = history_dir / f"{path.stem}_{stamp}-{suffix}{path.suffix}"
+            suffix += 1
+        shutil.copy2(path, archived)
+    path.write_text(content)
 
 
 def resolve_ai_path(target: Path, filename: str) -> Path:

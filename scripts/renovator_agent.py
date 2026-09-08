@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 from builder_agent import DEFAULT_COMMAND_TIMEOUT, run_agent
-from report_common import DEFAULT_ROUTER_URL, ReportError, read_required_artifact, resolve_ai_path
+from report_common import DEFAULT_ROUTER_URL, ReportError, read_required_artifact, resolve_ai_path, write_report
 
 DEFAULT_MAX_STEPS = 40
 # Was 20 ("a repair pass is scoped to a handful of defects, not a whole
@@ -96,7 +96,7 @@ def main() -> int:
     print(f"\n\nFinished after {steps} step(s).")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(report)
+    write_report(args.out, report)
     print(f"Wrote {args.out}")
 
     if touched:

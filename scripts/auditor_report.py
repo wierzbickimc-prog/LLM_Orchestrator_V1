@@ -24,6 +24,7 @@ from pathlib import Path
 
 from report_common import (
     DEFAULT_CHAR_BUDGET,
+    char_budget_for_role,
     DEFAULT_EXTENSIONS,
     DEFAULT_ROUTER_URL,
     NO_TOOLS_NOTICE,
@@ -34,6 +35,7 @@ from report_common import (
     describe_skipped,
     read_required_artifact,
     resolve_ai_path,
+    write_report,
 )
 
 # Long test output eats context fast without adding much signal past a
@@ -167,7 +169,11 @@ def main() -> int:
     parser.add_argument("--plan", type=Path, default=None, help="defaults to <path>/.ai/implementation-plan.md")
     parser.add_argument("--out", type=Path, default=None, help="defaults to <path>/.ai/audit-report.md")
     parser.add_argument("--router-url", default=DEFAULT_ROUTER_URL)
-    parser.add_argument("--char-budget", type=int, default=DEFAULT_CHAR_BUDGET)
+    parser.add_argument(
+        "--char-budget", type=int, default=None,
+        help="defaults to a value derived from the auditor role's context_window "
+        "(see char_budget_for_role in report_common.py)",
+    )
     parser.add_argument(
         "--ext", action="append", default=None,
         help="restrict to this extension (repeatable); default is a built-in source/text list",
@@ -189,6 +195,8 @@ def main() -> int:
         args.plan = resolve_ai_path(args.path, "implementation-plan.md")
     if args.out is None:
         args.out = resolve_ai_path(args.path, "audit-report.md")
+    if args.char_budget is None:
+        args.char_budget = char_budget_for_role("auditor")
 
     try:
         plan = read_required_artifact(args.plan, produced_by="scripts/planner_report.py")
@@ -267,7 +275,7 @@ def main() -> int:
     print()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(report)
+    write_report(args.out, report)
     print(f"Wrote {args.out}")
     return 0
 

@@ -29,6 +29,7 @@ from report_common import (
     looks_like_failed_tool_call,
     read_required_artifact,
     resolve_ai_path,
+    write_report,
     stream_chat,
 )
 
@@ -264,7 +265,7 @@ def main() -> int:
     print(f"\n\nFinished after {steps} step(s).")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(report)
+    write_report(args.out, report)
     print(f"Wrote {args.out}")
 
     if touched:

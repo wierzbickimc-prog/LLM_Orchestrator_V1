@@ -21,6 +21,7 @@ from pathlib import Path
 
 from report_common import (
     DEFAULT_CHAR_BUDGET,
+    char_budget_for_role,
     DEFAULT_EXTENSIONS,
     DEFAULT_ROUTER_URL,
     NO_TOOLS_NOTICE,
@@ -30,6 +31,7 @@ from report_common import (
     collect_files,
     describe_skipped,
     resolve_ai_path,
+    write_report,
 )
 
 SYSTEM_PROMPT = f"""You are a focused code-investigation assistant. {NO_TOOLS_NOTICE}
@@ -56,7 +58,11 @@ def main() -> int:
     parser.add_argument("path", type=Path, help="file or directory to scan")
     parser.add_argument("--out", type=Path, default=None, help="defaults to <path>/.ai/scout-report.md")
     parser.add_argument("--router-url", default=DEFAULT_ROUTER_URL)
-    parser.add_argument("--char-budget", type=int, default=DEFAULT_CHAR_BUDGET)
+    parser.add_argument(
+        "--char-budget", type=int, default=None,
+        help="defaults to a value derived from the scout role's context_window "
+        "(see char_budget_for_role in report_common.py)",
+    )
     parser.add_argument(
         "--ext", action="append", default=None,
         help="restrict to this extension (repeatable); default is a built-in source/text list",
@@ -66,6 +72,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.out is None:
         args.out = resolve_ai_path(args.path, "scout-report.md")
+    if args.char_budget is None:
+        args.char_budget = char_budget_for_role("scout")
 
     extensions = set(args.ext) if args.ext else DEFAULT_EXTENSIONS
     files = collect_files(args.path, extensions)
@@ -97,7 +105,7 @@ def main() -> int:
     print()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(report)
+    write_report(args.out, report)
     print(f"Wrote {args.out}")
     return 0
 
