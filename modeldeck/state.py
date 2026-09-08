@@ -235,6 +235,13 @@ def default_state() -> dict[str, Any]:
                 DEFAULT_SCOUT, 8010, "auto", "medium", 131_072, 3,
                 sampling_mode="thinking",
             ),
+            # Backs the Prompt development tab -- a pure prompt-drafting tool
+            # with no filesystem awareness. Separate from the normal Chat tab
+            # (roles["chat"]) so each can have independent model/port/sampling.
+            "prompt_dev": _role(
+                DEFAULT_SCOUT, 8012, "auto", "medium", 131_072, 3,
+                sampling_mode="thinking",
+            ),
         },
         "router": {"host": "127.0.0.1", "port": 8100},
         # Operator edits to the chat-client phase-injection prompts below (Admin

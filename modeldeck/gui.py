@@ -46,7 +46,16 @@ from .secrets import get_openai_api_key, set_openai_api_key
 from .state import activate_local, activate_planner, load_state, sampling_preset, save_state
 
 sys.path.insert(0, str(PROJECT_DIR / "scripts"))
-from report_common import parse_builder_accuracy, parse_verdict, stream_chat  # noqa: E402
+from report_common import (  # noqa: E402
+    DEFAULT_CHAR_BUDGET,
+    DEFAULT_EXTENSIONS,
+    build_context,
+    collect_files,
+    describe_skipped,
+    parse_builder_accuracy,
+    parse_verdict,
+    stream_chat,
+)
 
 
 def _thousands(value: int) -> str:
@@ -68,6 +77,15 @@ CHAT_SYSTEM_PROMPT = (
     "user asks for the prompt, output it as a single self-contained block of "
     "prose with no preamble, stating the goal, the constraints, and the "
     "acceptance criteria explicitly."
+)
+
+NORMAL_CHAT_SYSTEM_PROMPT = (
+    "You are a helpful coding assistant with access to the user's project files. "
+    "Answer questions about how code works, explain architecture, suggest changes, "
+    "and perform simple actions when asked. Be concise and practical. When the user "
+    "asks you to do something (e.g., 'launch this application'), explain what you "
+    "would do or provide the exact command -- you cannot execute commands yourself "
+    "unless explicitly given a tool interface."
 )
 
 
@@ -457,6 +475,11 @@ class MainWindow(QMainWindow):
         self.chat_bridge.finished.connect(self._chat_finished)
         self.chat_busy = False
         self.chat_history: list[dict[str, str]] = []
+        self.normal_chat_bridge = ChatBridge()
+        self.normal_chat_bridge.chunk.connect(self._normal_chat_chunk)
+        self.normal_chat_bridge.finished.connect(self._normal_chat_finished)
+        self.normal_chat_busy = False
+        self.normal_chat_history: list[dict[str, str]] = []
 
         # The shared Pipeline orchestrator -- all pipeline logic lives here.
         # The GUI is a thin adapter that translates Pipeline events into Qt signals.
@@ -485,7 +508,8 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_controls(models), "Deck")
-        tabs.addTab(self._build_chat(models), "Chat")
+        tabs.addTab(self._build_chat(models), "Prompt development")
+        tabs.addTab(self._build_normal_chat(models), "Chat")
         tabs.addTab(self._build_reports(), "Reports")
         tabs.addTab(self._build_admin(), "Admin")
         self.setCentralWidget(tabs)
@@ -855,7 +879,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(body)
         layout.setContentsMargins(22, 18, 22, 22)
 
-        heading = QLabel("Prompt workshop")
+        heading = QLabel("Prompt development")
         heading.setObjectName("title")
         layout.addWidget(heading)
         blurb = QLabel(
@@ -865,7 +889,17 @@ class MainWindow(QMainWindow):
         blurb.setWordWrap(True)
         layout.addWidget(blurb)
 
-        role = self.state["roles"]["chat"]
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Path"))
+        self.chat_path_field = QLineEdit()
+        self.chat_path_field.setPlaceholderText("Optional: target project path for context")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse_chat_path)
+        path_row.addWidget(self.chat_path_field, 1)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+
+        role = self.state["roles"]["prompt_dev"]
         picker = QHBoxLayout()
         picker.addWidget(QLabel("Model"))
         self.chat_model = QComboBox()
@@ -925,9 +959,9 @@ class MainWindow(QMainWindow):
         return body
 
     def _load_chat_model(self) -> None:
-        self.state["roles"]["chat"]["model"] = str(self.chat_model.currentData())
+        self.state["roles"]["prompt_dev"]["model"] = str(self.chat_model.currentData())
         save_state(self.state)
-        self.activate("chat")
+        self.activate("prompt_dev")
 
     def _chat_send(self) -> None:
         if self.chat_busy:
@@ -940,12 +974,27 @@ class MainWindow(QMainWindow):
         self.chat_transcript.appendPlainText(f"\n\n### you\n{message}\n\n### model\n")
         self.chat_busy = True
         self.chat_send_button.setEnabled(False)
-        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + list(self.chat_history)
+        system_content = CHAT_SYSTEM_PROMPT
+        path_str = self.chat_path_field.text().strip()
+        if path_str:
+            root = Path(path_str)
+            if root.exists():
+                context, included, skipped = self._build_path_context(root)
+                if context:
+                    note = describe_skipped(skipped)
+                    system_content += (
+                        "\n\nThe target project is at: " + path_str +
+                        ". Reference its structure when discussing scope.\n\nProject files:\n" +
+                        context + note
+                    )
+            else:
+                self.statusBar().showMessage(f"Warning: path does not exist: {path_str}", 5000)
+        messages = [{"role": "system", "content": system_content}] + list(self.chat_history)
 
         def work() -> None:
             try:
                 text = stream_chat(
-                    "chat", messages,
+                    "prompt_dev", messages,
                     on_chunk=lambda piece: self.chat_bridge.chunk.emit(piece),
                     router_url=self._router_base() + "/v1",
                     timeout=900.0,
@@ -996,6 +1045,172 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Prompt copied into the Deck tab's task field", 5000
         )
+
+    def _browse_chat_path(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Choose a project path")
+        if directory:
+            self.chat_path_field.setText(directory)
+
+    def _browse_normal_chat_path(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Choose a project path")
+        if directory:
+            self.normal_chat_path_field.setText(directory)
+
+    def _build_path_context(self, root: Path) -> tuple[str, list[Path], list[Path]]:
+        """Collect and budget file contents for the given path."""
+        files = collect_files(root, DEFAULT_EXTENSIONS)
+        if not files:
+            return "", [], []
+        context, included, skipped = build_context(files, DEFAULT_CHAR_BUDGET, cache_target=root)
+        return context, included, skipped
+
+    # ------------------------------------------------------------------
+    # Normal Chat tab
+    # ------------------------------------------------------------------
+
+    def _build_normal_chat(self, models: list[dict[str, Any]]) -> QWidget:
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(22, 18, 22, 22)
+
+        heading = QLabel("Chat")
+        heading.setObjectName("title")
+        layout.addWidget(heading)
+        blurb = QLabel(
+            "Ask questions about your project, request actions, or just talk "
+            "through ideas. Specify a path to ground responses in actual files."
+        )
+        blurb.setWordWrap(True)
+        layout.addWidget(blurb)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Path"))
+        self.normal_chat_path_field = QLineEdit()
+        self.normal_chat_path_field.setPlaceholderText("Project path to ground answers in")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse_normal_chat_path)
+        path_row.addWidget(self.normal_chat_path_field, 1)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+
+        role = self.state["roles"]["chat"]
+        picker = QHBoxLayout()
+        picker.addWidget(QLabel("Model"))
+        self.normal_chat_model = QComboBox()
+        names = [str(item.get("name") or item.get("id") or "") for item in models]
+        for name in names:
+            if name:
+                self.normal_chat_model.addItem(name, name)
+        current = str(role["model"])
+        if self.normal_chat_model.findData(current) < 0:
+            self.normal_chat_model.addItem(current, current)
+        self.normal_chat_model.setCurrentIndex(self.normal_chat_model.findData(current))
+        picker.addWidget(self.normal_chat_model, 1)
+        self.normal_chat_load_button = QPushButton("Load model")
+        self.normal_chat_load_button.setObjectName("launchButton")
+        self.normal_chat_load_button.setToolTip(
+            "Make this the resident local model (stops the others first, "
+            "same single-model discipline as the pipeline phases)."
+        )
+        self.normal_chat_load_button.clicked.connect(self._load_normal_chat_model)
+        picker.addWidget(self.normal_chat_load_button)
+        layout.addLayout(picker)
+
+        self.normal_chat_transcript = QPlainTextEdit()
+        self.normal_chat_transcript.setReadOnly(True)
+        self.normal_chat_transcript.setPlaceholderText(
+            "Load the chat model, then ask about your project."
+        )
+        mono_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        mono_font.setPointSize(11)
+        self.normal_chat_transcript.setFont(mono_font)
+        self.normal_chat_transcript.setMinimumHeight(360)
+        layout.addWidget(self.normal_chat_transcript, 1)
+
+        self.normal_chat_input = QPlainTextEdit()
+        self.normal_chat_input.setPlaceholderText("Your message…")
+        self.normal_chat_input.setMaximumHeight(120)
+        layout.addWidget(self.normal_chat_input)
+
+        row = QHBoxLayout()
+        self.normal_chat_send_button = QPushButton("Send")
+        self.normal_chat_send_button.setObjectName("launchButton")
+        self.normal_chat_send_button.clicked.connect(self._normal_chat_send)
+        row.addWidget(self.normal_chat_send_button)
+        clear_button = QPushButton("Clear conversation")
+        clear_button.clicked.connect(self._normal_chat_clear)
+        row.addWidget(clear_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return body
+
+    def _load_normal_chat_model(self) -> None:
+        self.state["roles"]["chat"]["model"] = str(self.normal_chat_model.currentData())
+        save_state(self.state)
+        self.activate("chat")
+
+    def _normal_chat_send(self) -> None:
+        if self.normal_chat_busy:
+            return
+        message = self.normal_chat_input.toPlainText().strip()
+        if not message:
+            return
+        self.normal_chat_input.clear()
+        self.normal_chat_history.append({"role": "user", "content": message})
+        self.normal_chat_transcript.appendPlainText(f"\n\n### you\n{message}\n\n### model\n")
+        self.normal_chat_busy = True
+        self.normal_chat_send_button.setEnabled(False)
+
+        system_content = NORMAL_CHAT_SYSTEM_PROMPT
+        path_str = self.normal_chat_path_field.text().strip()
+        if path_str:
+            root = Path(path_str)
+            if root.exists():
+                context, included, skipped = self._build_path_context(root)
+                if context:
+                    note = describe_skipped(skipped)
+                    system_content += (
+                        "\n\nThe user's project is at: " + path_str +
+                        ".\n\nProject files:\n" + context + note
+                    )
+            else:
+                self.statusBar().showMessage(f"Warning: path does not exist: {path_str}", 5000)
+        messages = [{"role": "system", "content": system_content}] + list(self.normal_chat_history)
+
+        def work() -> None:
+            try:
+                text = stream_chat(
+                    "chat", messages,
+                    on_chunk=lambda piece: self.normal_chat_bridge.chunk.emit(piece),
+                    router_url=self._router_base() + "/v1",
+                    timeout=900.0,
+                )
+            except Exception as exc:
+                self.normal_chat_bridge.finished.emit(False, str(exc))
+                return
+            self.normal_chat_bridge.finished.emit(True, text)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _normal_chat_chunk(self, piece: str) -> None:
+        cursor = self.normal_chat_transcript.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.normal_chat_transcript.setTextCursor(cursor)
+        self.normal_chat_transcript.insertPlainText(piece)
+        self.normal_chat_transcript.ensureCursorVisible()
+
+    def _normal_chat_finished(self, success: bool, text: str) -> None:
+        self.normal_chat_busy = False
+        self.normal_chat_send_button.setEnabled(True)
+        if not success:
+            self.normal_chat_transcript.appendPlainText(f"\n[failed: {text}]\n")
+            self.statusBar().showMessage("Chat request failed", 5000)
+            return
+        self.normal_chat_history.append({"role": "assistant", "content": text})
+
+    def _normal_chat_clear(self) -> None:
+        self.normal_chat_history.clear()
+        self.normal_chat_transcript.clear()
 
     def _build_reports(self) -> QWidget:
         scroll = QScrollArea()
@@ -1299,6 +1514,9 @@ class MainWindow(QMainWindow):
         chat_load = getattr(self, "chat_load_button", None)
         if chat_load is not None:
             chat_load.setEnabled(enabled)
+        normal_chat_load = getattr(self, "normal_chat_load_button", None)
+        if normal_chat_load is not None:
+            normal_chat_load.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Metrics / telemetry

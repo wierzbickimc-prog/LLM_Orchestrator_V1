@@ -250,7 +250,7 @@ class ProcessManager:
     def _phase_for_port(port: int) -> str:
         return {
             8000: "scout", 8002: "builder", 8004: "auditor",
-            8006: "renovator", 8008: "planner", 8010: "chat",
+            8006: "renovator", 8008: "planner", 8010: "chat", 8012: "prompt_dev",
         }.get(
             port, f"model-{port}"
         )

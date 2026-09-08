@@ -39,6 +39,7 @@ def make_state():
             "auditor": {"port": 8004, "model": "test-model"},
             "planner": {"port": 8008, "model": "test-model"},
             "chat": {"port": 8010, "model": "test-model"},
+            "prompt_dev": {"port": 8012, "model": "test-model"},
         },
         "router": {"host": "127.0.0.1", "port": 8100},
         "prompt_overrides": {},

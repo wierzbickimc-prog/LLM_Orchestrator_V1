@@ -155,7 +155,7 @@ def backend_for_model(model: str) -> Backend:
             reasoning_effort=str(planner_cfg.get("reasoning_effort") or "high"),
             provider="openai",
         )
-    if model in {"scout", "builder", "auditor", "renovator", "chat"}:
+    if model in {"scout", "builder", "auditor", "renovator", "chat", "prompt_dev"}:
         role = load_state()["roles"][model]
         reasoning = str(role.get("reasoning") or "auto")
         return Backend(
@@ -310,7 +310,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "active": workflow["active"],
-        "models": ["local", settings.scout.alias, settings.builder.alias, "planner", "auditor", "renovator", "chat"],
+        "models": ["local", settings.scout.alias, settings.builder.alias, "planner", "auditor", "renovator", "chat", "prompt_dev"],
     }
 
 
@@ -326,6 +326,7 @@ async def models() -> dict[str, Any]:
             {"id": "auditor", "object": "model", "owned_by": "local"},
             {"id": "renovator", "object": "model", "owned_by": "local"},
             {"id": "chat", "object": "model", "owned_by": "local"},
+            {"id": "prompt_dev", "object": "model", "owned_by": "local"},
         ],
     }
 
