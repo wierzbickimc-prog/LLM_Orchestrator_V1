@@ -34,6 +34,25 @@ from report_common import (
 )
 
 DEFAULT_MAX_STEPS = 80
+
+# Bounds a single turn's completion length -- see stream_chat's docstring
+# for the incident this exists to shorten, not prevent. 12,000 comfortably
+# covers a full single-shot rewrite of a large source file (observed
+# successful writes in this loop have topped out around 10-11k tokens) while
+# firmly cutting off the runaway case: the 798-second, 17,329-token turn
+# this cap is sized against never had a chance to reach that length in the
+# first place.
+MAX_COMPLETION_TOKENS = 12_000
+
+# After this many consecutive tool-call parse failures, the retry message
+# stops being the generic "try again" and starts naming the fix directly.
+# The system prompt already tells the model to split large writes up front;
+# this is for when it doesn't take that advice and just keeps re-attempting
+# the same oversized call -- observed live: three straight JSON-escaping
+# failures on one write_file, each answered with the same generic retry
+# text, before the fourth attempt spiraled into the runaway generation
+# above instead of ever trying something different.
+CONSECUTIVE_FAILURES_BEFORE_ESCALATION = 2
 # 40 wasn't enough in a live run: Builder's own final report used an
 # explicit [x]/[ ] checklist showing it knew devices.py/qc.py/serve.py/tests
 # were unfinished, but signaled done anyway instead of continuing. Whether
@@ -149,11 +168,13 @@ def run_agent(
         {"role": "user", "content": user_intro},
     ]
     touched: set[str] = set()
+    consecutive_parse_failures = 0
 
     for step in range(1, max_steps + 1):
         on_chunk(f"\n--- step {step} ---\n")
         response = stream_chat(
-            model_alias, messages, on_chunk=on_chunk, router_url=router_url, timeout=timeout
+            model_alias, messages, on_chunk=on_chunk, router_url=router_url, timeout=timeout,
+            max_tokens=MAX_COMPLETION_TOKENS,
         )
         messages.append({"role": "assistant", "content": response})
 
@@ -176,9 +197,27 @@ def run_agent(
         try:
             call = extract_tool_call(response)
         except ToolCallParseError as exc:
-            on_chunk(f"\n[invalid tool call: {exc}]\n")
-            messages.append({"role": "user", "content": f"Your last response was invalid: {exc}. Try again."})
+            consecutive_parse_failures += 1
+            on_chunk(f"\n[invalid tool call ({consecutive_parse_failures} in a row): {exc}]\n")
+            if consecutive_parse_failures >= CONSECUTIVE_FAILURES_BEFORE_ESCALATION:
+                # Repeating the same generic nudge did not work last time,
+                # so don't repeat it a third time -- name the fix directly.
+                # This is also very likely truncation from MAX_COMPLETION_TOKENS
+                # on a call that was too large to begin with, which is the
+                # same fix as the JSON-escaping case: make it smaller.
+                feedback = (
+                    f"That's {consecutive_parse_failures} failed attempts in a row on this same "
+                    f"call: {exc}. Stop retrying it as-is. Whatever you're writing is too large "
+                    "for one response -- split it now: a write_file call for roughly the first "
+                    "half of the content, then one or more append_file calls for the rest, each "
+                    "small enough to comfortably fit in a single response on its own."
+                )
+            else:
+                feedback = f"Your last response was invalid: {exc}. Try again."
+            messages.append({"role": "user", "content": feedback})
             continue
+
+        consecutive_parse_failures = 0
 
         if call is None:
             return response, step, sorted(touched)

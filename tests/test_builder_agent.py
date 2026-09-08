@@ -14,7 +14,7 @@ import builder_agent  # noqa: E402
 def _canned_responses(*responses):
     calls = iter(responses)
 
-    def fake_stream_chat(model_alias, messages, on_chunk=None, router_url="", timeout=0):
+    def fake_stream_chat(model_alias, messages, on_chunk=None, router_url="", timeout=0, max_tokens=None):
         return next(calls)
 
     return fake_stream_chat
@@ -138,6 +138,92 @@ class RunAgentTests(unittest.TestCase):
                 )
             self.assertEqual(steps, 5)
             self.assertIn("Stopped after 5 steps", report)
+
+    def test_every_turn_is_capped_at_max_completion_tokens(self) -> None:
+        # This is the fix for a live incident: an agentic loop stuck on
+        # repeated JSON-escaping failures spiraled into one 798-second,
+        # 17,329-token turn with nothing capping how long it could run.
+        seen_max_tokens = []
+
+        def fake_stream_chat(model_alias, messages, on_chunk=None, router_url="", timeout=0, max_tokens=None):
+            seen_max_tokens.append(max_tokens)
+            return "Done, nothing to do."
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(builder_agent, "stream_chat", fake_stream_chat):
+                builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None,
+                )
+        self.assertEqual(seen_max_tokens, [builder_agent.MAX_COMPLETION_TOKENS])
+
+    def test_repeated_parse_failures_escalate_to_a_specific_fix(self) -> None:
+        # The generic "try again" message did not work live: three straight
+        # identical JSON-escaping failures on one write_file, each met with
+        # the same generic nudge, before the model gave up retrying it
+        # sanely and produced the runaway turn above instead. After
+        # CONSECUTIVE_FAILURES_BEFORE_ESCALATION failures in a row, the
+        # feedback has to stop being generic and start naming the fix.
+        fed_back_messages = []
+        threshold = builder_agent.CONSECUTIVE_FAILURES_BEFORE_ESCALATION
+        responses = _canned_responses(
+            *(["```tool\n{not valid json\n```"] * threshold),
+            "Done, gave up on that approach.",
+        )
+
+        def fake_stream_chat(model_alias, messages, on_chunk=None, router_url="", timeout=0, max_tokens=None):
+            fed_back_messages.append(messages[-1]["content"] if messages[-1]["role"] == "user" else None)
+            return responses(model_alias, messages, on_chunk, router_url, timeout, max_tokens)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(builder_agent, "stream_chat", fake_stream_chat):
+                report, steps, _touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None,
+                )
+            self.assertEqual(steps, threshold + 1)
+            self.assertIn("Done", report)
+            # The feedback fed back to the model after the threshold-th
+            # failure must name the actual fix (splitting the write), not
+            # repeat the same generic "try again" it already ignored once.
+            escalated = fed_back_messages[threshold]
+            self.assertIn("split", escalated.lower())
+            self.assertIn(f"{threshold} failed attempts", escalated)
+
+    def test_a_successful_call_between_failures_resets_the_escalation_counter(self) -> None:
+        # One-off parse failures are normal and shouldn't trip the
+        # escalated message just because they're not adjacent to each
+        # other in the run -- only a genuine consecutive streak should.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.py").write_text("x = 1")
+            fed_back_messages = []
+            responses = _canned_responses(
+                "```tool\n{not valid json\n```",
+                '```tool\n{"name": "read_file", "arguments": {"path": "a.py"}}\n```',
+                "```tool\n{not valid json\n```",
+                "Done.",
+            )
+
+            def fake_stream_chat(model_alias, messages, on_chunk=None, router_url="", timeout=0, max_tokens=None):
+                fed_back_messages.append(messages[-1]["content"] if messages[-1]["role"] == "user" else None)
+                return responses(model_alias, messages, on_chunk, router_url, timeout, max_tokens)
+
+            with patch.object(builder_agent, "stream_chat", fake_stream_chat):
+                builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None,
+                )
+            # Both parse failures were isolated (a successful read_file sat
+            # between them), so neither should have triggered escalation.
+            for message in fed_back_messages:
+                if message and "invalid" in message.lower():
+                    self.assertNotIn("split", message.lower())
 
 
 if __name__ == "__main__":

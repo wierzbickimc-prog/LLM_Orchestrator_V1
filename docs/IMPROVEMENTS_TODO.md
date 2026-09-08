@@ -111,6 +111,24 @@ the way it is.
 
 ## Done
 
+- **The Builder crash from turn 9 (see the entry below) is now actually
+  mitigated, not just diagnosed.** Two fixes in scripts/builder_agent.py
+  and scripts/report_common.py's stream_chat: (1) every agentic turn now
+  sends `max_tokens=12000`, so a stuck generation gets truncated in
+  seconds instead of running until mtplx's own repetition-holdback and
+  300s stream-stall watchdog eventually kill it -- the incident's 798-
+  second, 17,329-token turn would never have gotten past 12k under this
+  cap; (2) after 2 consecutive tool-call parse failures, the feedback
+  message stops repeating the generic "try again" (which visibly didn't
+  work -- the incident had three identical failures in a row before the
+  runaway turn) and names the fix directly: split the write into a
+  write_file call plus one or more append_file calls. Renovator reuses
+  run_agent() unchanged, so both fixes cover it automatically. Neither
+  fix addresses *why* the model breaks JSON escaping on a large write in
+  the first place -- that's still open -- but both shorten the failure
+  from a 13-minute dead end to a fast, cheap one the loop recovers from.
+
+
 - **Char budget now derives from the role's actual context_window, and
   report artifacts no longer overwrite their own history.** Two fixes to
   the same class of problem found analyzing the two most recent runs:

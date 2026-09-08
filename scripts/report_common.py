@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 DEFAULT_ROUTER_URL = "http://127.0.0.1:8100/v1"
 
@@ -452,6 +452,7 @@ def stream_chat(
     on_chunk: Callable[[str], None] | None = None,
     router_url: str = DEFAULT_ROUTER_URL,
     timeout: float = 600.0,
+    max_tokens: int | None = None,
 ) -> str:
     """Call the model over the router's streaming endpoint with an arbitrary
     message history, returning the full response text. If on_chunk is
@@ -472,13 +473,25 @@ def stream_chat(
     one-shot scout/planner/auditor path, with no retry loop of its own)
     raises on it. builder_agent.py's loop calls stream_chat directly
     because it retries this exact failure itself; raising here would
-    short-circuit that retry before the loop ever saw the response."""
+    short-circuit that retry before the loop ever saw the response.
+
+    max_tokens bounds a single turn's blast radius. Left unset, one stuck
+    generation can run for as long as the remaining context window allows --
+    observed live in an agentic loop stuck re-attempting a large write_file
+    after repeated JSON-escaping failures: a single turn ran 798 seconds and
+    17,329 tokens before mtplx's own repetition-holdback safety net and
+    300-second stream-stall watchdog killed it, having produced nothing
+    usable. A cap doesn't fix why the model got stuck, but it turns a
+    13-minute dead end into a fast, cheap failure the retry loop gets back
+    control from instead."""
     url = router_url.rstrip("/") + "/chat/completions"
-    payload = {
+    payload: dict[str, Any] = {
         "model": model_alias,
         "stream": True,
         "messages": messages,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
