@@ -255,6 +255,15 @@ class RoleEditor(QGroupBox):
         self.reasoning = QComboBox()
         self.reasoning.addItems(["off", "auto", "on"])
         self.reasoning.setCurrentText(str(role["reasoning"]))
+        # MoE models (Ornith included, per the operator's own testing) have
+        # been reported unusually sensitive to paged-KV cache quantization --
+        # this used to be a "q8" hardcode buried in _role()'s default, only
+        # changeable by hand-editing state.json. mtplx's own valid set is
+        # exactly {"off", "q8", "q4"} (see `mtplx serve --help`).
+        self.kv_quantization = QComboBox()
+        self.kv_quantization.addItems(["off", "q8", "q4"])
+        kv_index = self.kv_quantization.findText(str(role.get("kv_quantization", "q8")))
+        self.kv_quantization.setCurrentIndex(kv_index if kv_index >= 0 else 1)
         self.context = QSpinBox()
         self.context.setRange(4096, 262144)
         self.context.setSingleStep(1024)
@@ -319,6 +328,8 @@ class RoleEditor(QGroupBox):
         compact.addWidget(self.depth)
         compact.addWidget(QLabel("Reasoning"))
         compact.addWidget(self.reasoning)
+        compact.addWidget(QLabel("KV quant"))
+        compact.addWidget(self.kv_quantization)
         if self.is_agentic:
             compact.addWidget(QLabel("Max turns"))
             compact.addWidget(self.max_steps)
@@ -367,6 +378,7 @@ class RoleEditor(QGroupBox):
     def apply(self, role: dict[str, Any]) -> None:
         role["model"] = self.models.currentData()
         role["reasoning"] = self.reasoning.currentText()
+        role["kv_quantization"] = self.kv_quantization.currentText()
         role["context_window"] = self.context.value()
         role["depth"] = self.depth.value()
         role["sampling_mode"] = self.sampling_mode.currentData()
