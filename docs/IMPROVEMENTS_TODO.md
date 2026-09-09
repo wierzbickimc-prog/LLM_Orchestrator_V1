@@ -111,6 +111,37 @@ the way it is.
 
 ## Done
 
+- **profile, KV quantization, depth, and native tool-calling are now all
+  editable in the Deck tab, and Apply preset pulls all four from one
+  shared table.** Depth and KV quant already had controls; profile and
+  native tool-calling had none at all -- state.json/CLI-flag only, the
+  same starting point KV quant was at before it got a control. Refactored
+  the ad hoc `_PROFILE_BY_FAMILY` dict from the previous entry into
+  `recommended_serving_settings(model) -> {"profile", "kv_quantization",
+  "depth"} | None` in state.py, used by both `_role()`'s defaults and the
+  GUI now -- one table, not two, so they can't drift apart from each
+  other the way DEFAULT_CHAR_BUDGET once did. native_tool_calling is
+  deliberately *not* in that table: unlike the other three, it isn't a
+  published model-family property, it's "does this specific model behave
+  well with mtplx's native tool-call parser" -- validated per model, not
+  inferable from the family name. Apply preset defaults it to True for a
+  recognized, agentic-role model anyway, since every model actually
+  benchmarked (Qwen3.6, Qwen3.8, Ornith) came back safe under it and it's
+  the fix for a real failure (Ornith failed 0/3 without it).
+
+  The native-tool-calling checkbox only exists for agentic roles
+  (Builder/Renovator) -- same `is_agentic` gate already used for
+  max_steps, since the flag is a no-op for the one-shot roles that never
+  touch the tool loop at all.
+
+  220 tests pass (11 new). One thing caught while testing: exercising the
+  GUI's existing "no published sampling preset" path for an unrecognized
+  model pops a real, blocking `QMessageBox` under the offscreen test
+  platform -- hung the test run rather than failing it. Moved that
+  specific check down to the `recommended_serving_settings` layer, which
+  is what actually owns the behavior anyway.
+
+
 - **Set Builder/Auditor to Qwen3.6 Balance and Planner/Renovator to
   Qwen3.8 Quality, backed by the full 5-model x 2-convention benchmark**
   (see the native-tool-calling and harder-task entries above). Neither

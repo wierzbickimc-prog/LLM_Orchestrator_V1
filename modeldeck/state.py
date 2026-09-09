@@ -304,22 +304,52 @@ def default_state() -> dict[str, Any]:
     }
 
 
-# mtplx serve profiles: "turbo" is the compiled/verified kernel path built
-# for the quantized dense 27B/9B flagships specifically; "sustained" is the
-# long-context MTP path (chunked prefill, request-sized KV) that's the
-# actual default for everything else, MoE included. Confirmed directly
-# from mtplx's own installed_models() `recommended_profile` field per
-# model, not inferred: every Qwen3.6-35B-A3B and Ornith-1.5-35B variant
-# reports "sustained", every Qwen3.8-27B variant reports "turbo". This
-# used to be a single hardcoded "turbo" default below regardless of model
-# -- silently wrong for every MoE role (scout/chat/prompt_dev included)
-# until that was caught. Deriving it from the family instead of a literal
-# means it can't drift the same way again as new roles get added.
-_PROFILE_BY_FAMILY = {
-    "Qwen3.6-35B": "sustained",
-    "Ornith-1.5-35B": "sustained",
-    "Qwen3.8-27B": "turbo",
+# Per-family serving recommendations, backed by measurement rather than
+# guesses -- see docs/DEPTH_TUNING.md and the benchmark comments on the
+# builder/auditor/renovator/planner roles below for the evidence each of
+# these three fields comes from:
+#   - profile: "turbo" is the compiled/verified kernel path built for the
+#     quantized dense 27B/9B flagships specifically; "sustained" is the
+#     long-context MTP path (chunked prefill, request-sized KV) that's the
+#     actual default for everything else, MoE included. Confirmed directly
+#     from mtplx's own installed_models() `recommended_profile` field per
+#     model, not inferred. This used to be a single hardcoded "turbo"
+#     regardless of model -- silently wrong for every MoE role until caught.
+#   - kv_quantization: MoE models are reportedly more sensitive to KV-cache
+#     quantization than dense ones, and "off" is cheap for them specifically
+#     -- their hybrid linear/full-attention architecture keeps full-precision
+#     KV under ~2.5GB even at 131K context, not the tens of GB a classic
+#     dense-attention model would need.
+#   - depth: mtplx's own `tune` data shows deeper MTP speculation actively
+#     hurts the MoE models (third-position acceptance collapses to ~1-30%,
+#     making depth 3 slower than no speculation at all) while it helps the
+#     dense family (acceptance holds at 81-92%, up to 2.79x over
+#     autoregressive decode).
+# Used both to derive _role()'s defaults below and by the Deck tab's Apply
+# preset button (see RoleEditor._apply_sampling_preset in gui.py) -- one
+# table, not two, so they can't drift apart from each other.
+_SERVING_RECOMMENDATIONS_BY_FAMILY: dict[str, dict[str, Any]] = {
+    "Qwen3.6-35B": {"profile": "sustained", "kv_quantization": "off", "depth": 1},
+    "Ornith-1.5-35B": {"profile": "sustained", "kv_quantization": "off", "depth": 1},
+    "Qwen3.8-27B": {"profile": "turbo", "kv_quantization": "q8", "depth": 3},
 }
+
+
+def recommended_serving_settings(model_repo_id: str) -> dict[str, Any] | None:
+    """profile/kv_quantization/depth recommended for this model's family, or
+    None if the family is unrecognized -- callers should leave whatever the
+    role already has rather than guess. Deliberately does not include
+    native_tool_calling: unlike the other three, that isn't a model-family
+    property published anywhere -- it's "does this specific model behave
+    well with mtplx's native tool-call parser", validated per model, not
+    inferrable from the family name. Every model actually tested (Qwen3.6,
+    Qwen3.8, Ornith) came back safe, so callers that want a recommendation
+    for it can reasonably default to True for agentic roles -- but that's a
+    judgment call for the caller, not a fact this function can state."""
+    family = model_family(model_repo_id)
+    if family is None:
+        return None
+    return _SERVING_RECOMMENDATIONS_BY_FAMILY.get(family)
 
 
 def _role(
@@ -337,7 +367,7 @@ def _role(
     profile: str | None = None,
 ) -> dict[str, Any]:
     sampling = sampling_preset(model, sampling_mode) or dict(_GENERIC_SAMPLING_FALLBACK)
-    resolved_profile = profile or _PROFILE_BY_FAMILY.get(model_family(model) or "", "turbo")
+    resolved_profile = profile or (recommended_serving_settings(model) or {}).get("profile", "turbo")
     return {
         "model": model,
         "port": port,

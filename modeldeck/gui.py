@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QFontDatabase, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -43,7 +44,14 @@ from .mtplx import PROJECT_DIR, ProcessManager, fetch_json, fetch_sse_snapshot, 
 from .pipeline import PIPELINE_ORDER, STATUS_PHASES, Pipeline
 from .prompts import PROMPTS
 from .secrets import get_openai_api_key, set_openai_api_key
-from .state import activate_local, activate_planner, load_state, sampling_preset, save_state
+from .state import (
+    activate_local,
+    activate_planner,
+    load_state,
+    recommended_serving_settings,
+    sampling_preset,
+    save_state,
+)
 
 sys.path.insert(0, str(PROJECT_DIR / "scripts"))
 from report_common import (  # noqa: E402
@@ -264,6 +272,15 @@ class RoleEditor(QGroupBox):
         self.kv_quantization.addItems(["off", "q8", "q4"])
         kv_index = self.kv_quantization.findText(str(role.get("kv_quantization", "q8")))
         self.kv_quantization.setCurrentIndex(kv_index if kv_index >= 0 else 1)
+        # Full valid set per `mtplx serve --help` -- turbo/sustained are the
+        # only two this app's own Apply-preset recommendations ever choose
+        # (see recommended_serving_settings), the rest stay available for
+        # manual use (e.g. performance-cold+max for what mtplx's own app
+        # calls "Burst"; this GUI doesn't expose that combination directly).
+        self.profile = QComboBox()
+        self.profile.addItems(["turbo", "sustained", "stable", "performance-cold", "exact", "max-diagnostic"])
+        profile_index = self.profile.findText(str(role.get("profile", "turbo")))
+        self.profile.setCurrentIndex(profile_index if profile_index >= 0 else 0)
         self.context = QSpinBox()
         self.context.setRange(4096, 262144)
         self.context.setSingleStep(1024)
@@ -279,6 +296,19 @@ class RoleEditor(QGroupBox):
         self.max_steps.setRange(0, 500)
         self.max_steps.setValue(int(role.get("max_steps") or 0))
         self.is_agentic = int(role.get("max_steps") or 0) > 0
+
+        # Same is_agentic gate as max_steps -- native tool-calling only
+        # means anything for Builder/Renovator's agentic loop, never for a
+        # one-shot call_model() request (see native_tool_calling's comment
+        # in state.py's _role()).
+        self.native_tool_calling = QCheckBox("Native tool-calling")
+        self.native_tool_calling.setChecked(bool(role.get("native_tool_calling", False)))
+        self.native_tool_calling.setToolTip(
+            "Use OpenAI-style tool_calls instead of the ```tool text convention. "
+            "Requires the model to actually support mtplx's native tool-call parser -- "
+            "confirmed safe for every model this app currently ships (Qwen3.6, Qwen3.8, "
+            "Ornith), but untested for anything else."
+        )
 
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
@@ -330,9 +360,12 @@ class RoleEditor(QGroupBox):
         compact.addWidget(self.reasoning)
         compact.addWidget(QLabel("KV quant"))
         compact.addWidget(self.kv_quantization)
+        compact.addWidget(QLabel("Profile"))
+        compact.addWidget(self.profile)
         if self.is_agentic:
             compact.addWidget(QLabel("Max turns"))
             compact.addWidget(self.max_steps)
+            compact.addWidget(self.native_tool_calling)
         form.addRow(compact)
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Sampling preset"))
@@ -375,15 +408,42 @@ class RoleEditor(QGroupBox):
         self.presence_penalty.setValue(preset["presence_penalty"])
         self.repetition_penalty.setValue(preset["repetition_penalty"])
 
+        # profile/kv_quantization/depth: not sampling parameters at all,
+        # but the same "apply the benchmark-backed recommendation for this
+        # model" idea -- see recommended_serving_settings in state.py for
+        # what backs each of the three. Silently leaves them unchanged for
+        # an unrecognized model family rather than guessing.
+        serving = recommended_serving_settings(model)
+        if serving is not None:
+            profile_index = self.profile.findText(serving["profile"])
+            if profile_index >= 0:
+                self.profile.setCurrentIndex(profile_index)
+            kv_index = self.kv_quantization.findText(serving["kv_quantization"])
+            if kv_index >= 0:
+                self.kv_quantization.setCurrentIndex(kv_index)
+            self.depth.setValue(serving["depth"])
+            # Not part of recommended_serving_settings on purpose -- see
+            # that function's docstring. Every model actually benchmarked
+            # in this app (Qwen3.6, Qwen3.8, Ornith) came back safe under
+            # native tool-calling, and it's the fix for a real failure
+            # (Ornith failed 0/3 without it on a harder task) -- reasonable
+            # to default on for a recognized, agentic-role model. Not
+            # touched for one-shot roles (self.is_agentic gates the
+            # control's existence, same as max_steps).
+            if self.is_agentic:
+                self.native_tool_calling.setChecked(True)
+
     def apply(self, role: dict[str, Any]) -> None:
         role["model"] = self.models.currentData()
         role["reasoning"] = self.reasoning.currentText()
         role["kv_quantization"] = self.kv_quantization.currentText()
+        role["profile"] = self.profile.currentText()
         role["context_window"] = self.context.value()
         role["depth"] = self.depth.value()
         role["sampling_mode"] = self.sampling_mode.currentData()
         if self.is_agentic:
             role["max_steps"] = self.max_steps.value()
+            role["native_tool_calling"] = self.native_tool_calling.isChecked()
         role["temperature"] = self.temperature.value()
         role["top_p"] = self.top_p.value()
         role["top_k"] = self.top_k.value()
