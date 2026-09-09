@@ -60,6 +60,11 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="run the loop but log intended writes/commands instead of executing them",
     )
+    parser.add_argument(
+        "--native-tool-calling", action="store_true",
+        help="use OpenAI-style tool_calls instead of the ```tool convention -- only works if "
+        "the renovator role's model server was launched with --tool-prompt-mode native",
+    )
     args = parser.parse_args()
 
     if not args.path.is_dir():
@@ -89,6 +94,7 @@ def main() -> int:
             args.router_url, args.timeout, args.dry_run,
             on_chunk=lambda piece: print(piece, end="", flush=True),
             model_alias="renovator",
+            native_tool_calling=args.native_tool_calling,
         )
     except ReportError as exc:
         print(str(exc), file=sys.stderr)

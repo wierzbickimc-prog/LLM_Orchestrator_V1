@@ -111,6 +111,64 @@ the way it is.
 
 ## Done
 
+- **Added an opt-in native tool-calling path, and it fixed a real Ornith
+  failure the hand-rolled convention couldn't.** This project has always
+  avoided sending an OpenAI `tools` field (see report_common.stream_chat's
+  docstring) because that routes requests through mtplx's
+  `--tool-prompt-mode hybrid` bridge, which produced real parse failures
+  going through a chat-client extension early in the project. That finding
+  didn't generalize to every model: Ornith-1.5 is specifically trained for
+  tool use, and on the "hard" structural-save task (see below) it failed
+  0/3 attempts under the hand-rolled convention -- not occasional
+  hiccups, but a real, reproducible loop, repeatedly attempting a native
+  `<tool_call>` despite being told on every single turn there's no
+  tool-calling API here. Confirmed live that mtplx supports a proper
+  native mode for this: launching with `--tool-prompt-mode native
+  --reasoning-parser qwen3` produces clean, correctly-parsed
+  `tool_calls` responses (`tool_parser_source: "native"`/
+  `"streaming_translator"`, zero raw markup leaking through), with
+  reasoning cleanly separated into its own `reasoning_content` delta
+  channel instead of mixed into content.
+
+  Added `native_tool_calling: bool` as a per-role flag (default `False`,
+  so Qwen3.6/3.8 -- proven reliable on the hand-rolled convention -- are
+  completely unaffected), `stream_chat_native` (report_common.py) sending
+  the `tools` field and accumulating streamed `tool_calls` deltas by
+  index, `OPENAI_TOOL_SCHEMA` (builder_tools.py) translating the existing
+  five actions, and `_run_agent_native` (builder_agent.py) -- a parallel
+  loop to the default one, not an inline branch, since the two message
+  histories differ enough (OpenAI tool-role messages vs. a single fenced
+  block in plain text) that interleaving them would hurt both. Re-ran
+  Ornith on the exact task that failed 3/3 times: 19 clean steps, correct
+  reasoned decision, even caught and fixed its own test bug mid-run.
+  212 -> 224 tests (12 new, covering the native loop's tool-result
+  message shape, ask_question-as-tool-result, truncated-argument retry,
+  and the same empty-response/max-steps guards the default loop has).
+
+  Not yet done: the corresponding test on Qwen3.6/3.8 under native mode
+  (does it help, hurt, or not matter for models the hand-rolled
+  convention already serves well?), and a Deck-tab control for the flag
+  (currently state.json/CLI-flag only, same starting point kv_quantization
+  had before it got a GUI control).
+
+- **Designed a harder benchmark task specifically to stress judgment
+  under ambiguity: the structural-save defect ("added/deleted steps not
+  saved"), left deliberately less prescriptive than the earlier mm:ss
+  task.** The mm:ss task's fully-scaffolded plan let every model succeed
+  identically (a useful speed comparison, but not a completeness one).
+  This one hands over the scout report's own honest conclusion --
+  static analysis cannot reproduce the symptom -- and requires the
+  builder to choose and defend one of three real paths (a defensible
+  low-risk fix, a persistence-layer regression test, or "no safe action
+  is justified") rather than follow a recipe. Two of three tested
+  builders chose (b) independently and defended it well: Qwen3.6 Balance
+  (453s, 16 steps) and Ornith under native tool-calling (651s, 19
+  steps, plus a second, more thorough test than Qwen3.6 added). Both
+  explicitly followed the plan's warning about a prior run's test being
+  silently never executed by the self-runner, verifying via `pytest -k`
+  independently rather than trusting the self-runner's count alone.
+
+
 - **Added Ornith-1.5-35B-A3B as a benchmarkable model, and fixed a real
   crash its architecture exposed in the agentic loop.** Same MoE class as
   the existing Scout/Builder model (35B total, ~3B active), added via

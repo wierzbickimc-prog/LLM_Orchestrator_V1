@@ -145,6 +145,14 @@ def model_command(
         str(role["fan_mode"]),
         "--no-auth",
     ]
+    if role.get("native_tool_calling"):
+        # native uses the model chat template's own tool rendering instead
+        # of mtplx's legacy hybrid bridge -- see the native_tool_calling
+        # comment in state.py's _role() for why this is opt-in per role
+        # rather than the project default. qwen3 is correct for every
+        # model this app currently ships (Qwen3.6/3.8 and Ornith-1.5 are
+        # all Qwen-lineage), so it's not made configurable per role yet.
+        command += ["--tool-prompt-mode", "native", "--reasoning-parser", "qwen3"]
     environment = os.environ.copy()
     environment.update(
         {

@@ -543,6 +543,133 @@ def stream_chat(
     return "".join(full_text)
 
 
+def stream_chat_native(
+    model_alias: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict],
+    on_chunk: Callable[[str], None] | None = None,
+    router_url: str = DEFAULT_ROUTER_URL,
+    timeout: float = 600.0,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Like stream_chat, but sends an OpenAI `tools` field and returns
+    structured native tool_calls instead of expecting the model to emit a
+    ```tool fence in plain text.
+
+    This is the alternative this project deliberately avoided by default
+    (see stream_chat's docstring) after a real failure going through
+    mtplx's --tool-prompt-mode *hybrid* bridge. That finding doesn't
+    automatically generalize to every model: Ornith-1.5 is specifically
+    trained for tool use and its own serving recipe calls for mtplx's
+    *native* tool-prompt mode plus a matching reasoning parser -- a
+    different mechanism than the one that broke before. Confirmed live
+    against a role launched with --tool-prompt-mode native
+    --reasoning-parser qwen3: clean single tool_calls responses, correctly
+    parsed (`tool_parser_source: "native"`/`"streaming_translator"`,
+    `tool_parse_status: "parsed"`/`"success"`), reasoning cleanly separated
+    into its own `reasoning_content` delta channel rather than mixed into
+    `content`. This function only works when the *server* is actually
+    launched with that mode -- callers are responsible for the role being
+    configured accordingly (see native_tool_calling in modeldeck/state.py).
+
+    Returns {"content": str, "reasoning_content": str, "tool_calls":
+    [{"id", "name", "arguments" (parsed dict, or None if invalid JSON)}],
+    "finish_reason": str | None}. tool_calls is [] when the model replied
+    with plain text instead of calling a tool -- callers should treat that
+    the same way extract_tool_call's None return is treated: the model is
+    done."""
+    url = router_url.rstrip("/") + "/chat/completions"
+    payload: dict[str, Any] = {
+        "model": model_alias,
+        "stream": True,
+        "messages": messages,
+        "tools": tools,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Model-Deck-Skip-Injection": "1",
+        },
+        method="POST",
+    )
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    # Keyed by the delta's own "index" -- tool_calls stream incrementally,
+    # a first chunk carrying {index, id, type, function:{name, arguments:""}}
+    # and subsequent chunks for the same index carrying only
+    # {index, function:{arguments: "<more JSON text>"}} to concatenate.
+    calls_by_index: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            buffer = ""
+            for raw_line in response:
+                buffer += raw_line.decode("utf-8", errors="replace")
+                while "\n\n" in buffer:
+                    event, buffer = buffer.split("\n\n", 1)
+                    for line in event.splitlines():
+                        line = line.strip("\r")
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[len("data: "):]
+                        if data == "[DONE]":
+                            continue
+                        try:
+                            parsed = json.loads(data)
+                        except ValueError:
+                            continue
+                        choices = parsed.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        delta = choice.get("delta") or {}
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+                            if on_chunk is not None:
+                                on_chunk(delta["content"])
+                        if delta.get("reasoning_content"):
+                            reasoning_parts.append(delta["reasoning_content"])
+                        for tc_delta in delta.get("tool_calls") or []:
+                            index = tc_delta.get("index", 0)
+                            entry = calls_by_index.setdefault(
+                                index, {"id": None, "name": None, "arguments": ""},
+                            )
+                            if tc_delta.get("id"):
+                                entry["id"] = tc_delta["id"]
+                            fn = tc_delta.get("function") or {}
+                            if fn.get("name"):
+                                entry["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                entry["arguments"] += fn["arguments"]
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise ReportError(f"Router returned {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise ReportError(f"Could not reach router at {router_url}: {exc}") from exc
+
+    tool_calls = []
+    for index in sorted(calls_by_index):
+        entry = calls_by_index[index]
+        try:
+            arguments = json.loads(entry["arguments"]) if entry["arguments"] else {}
+        except ValueError:
+            arguments = None
+        tool_calls.append({"id": entry["id"], "name": entry["name"], "arguments": arguments})
+
+    return {
+        "content": "".join(content_parts),
+        "reasoning_content": "".join(reasoning_parts),
+        "tool_calls": tool_calls,
+        "finish_reason": finish_reason,
+    }
+
+
 def call_model(
     model_alias: str,
     system_prompt: str,

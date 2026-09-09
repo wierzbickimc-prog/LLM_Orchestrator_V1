@@ -266,5 +266,142 @@ class RunAgentTests(unittest.TestCase):
             self.assertIn("Stopped after 5 steps", report)
 
 
+def _native_result(content="", tool_calls=None, finish_reason=None):
+    return {
+        "content": content, "reasoning_content": "",
+        "tool_calls": tool_calls or [], "finish_reason": finish_reason,
+    }
+
+
+class RunAgentNativeTests(unittest.TestCase):
+    """The native_tool_calling=True path (see builder_agent._run_agent_native),
+    exercised the same way as the default loop above but through
+    stream_chat_native's structured tool_calls instead of a fenced ```tool
+    block in plain text."""
+
+    def setUp(self) -> None:
+        self.calls = []
+
+    def _fake_stream(self, *results):
+        it = iter(results)
+
+        def fake(model_alias, messages, tools, on_chunk=None, router_url="", timeout=0, max_tokens=None):
+            self.calls.append(messages)
+            return next(it)
+
+        return fake
+
+    def test_reads_writes_then_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.py").write_text("x = 1")
+            results = [
+                _native_result(tool_calls=[{"id": "call_1", "name": "read_file", "arguments": {"path": "a.py"}}], finish_reason="tool_calls"),
+                _native_result(tool_calls=[{"id": "call_2", "name": "write_file", "arguments": {"path": "a.py", "content": "x = 2"}}], finish_reason="tool_calls"),
+                _native_result(content="Done. Changed a.py.", finish_reason="stop"),
+            ]
+            with patch.object(builder_agent, "stream_chat_native", self._fake_stream(*results)):
+                report, steps, touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None, native_tool_calling=True,
+                )
+            self.assertEqual(steps, 3)
+            self.assertIn("Done.", report)
+            self.assertEqual((root / "a.py").read_text(), "x = 2")
+            self.assertEqual(touched, ["a.py"])
+
+    def test_tool_result_is_fed_back_as_a_tool_role_message(self) -> None:
+        # The defining difference from the default loop: results come back
+        # as {"role": "tool", "tool_call_id": ...}, not a "user"-role
+        # prose message -- this is what makes it valid OpenAI tool-call
+        # history rather than a lookalike that happens to work.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.py").write_text("x = 1")
+            results = [
+                _native_result(tool_calls=[{"id": "call_abc", "name": "read_file", "arguments": {"path": "a.py"}}], finish_reason="tool_calls"),
+                _native_result(content="Done.", finish_reason="stop"),
+            ]
+            with patch.object(builder_agent, "stream_chat_native", self._fake_stream(*results)):
+                builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None, native_tool_calling=True,
+                )
+            second_call_messages = self.calls[1]
+            tool_message = second_call_messages[-1]
+            self.assertEqual(tool_message["role"], "tool")
+            self.assertEqual(tool_message["tool_call_id"], "call_abc")
+            self.assertEqual(tool_message["content"], "x = 1")
+
+    def test_ask_question_blocks_on_input_and_feeds_answer_back_as_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = [
+                _native_result(tool_calls=[{"id": "call_q", "name": "ask_question", "arguments": {"question": "Which approach?"}}], finish_reason="tool_calls"),
+                _native_result(content="Done, used approach A.", finish_reason="stop"),
+            ]
+            with patch.object(builder_agent, "stream_chat_native", self._fake_stream(*results)):
+                with patch("builtins.input", return_value="Approach A"):
+                    report, steps, _touched = builder_agent.run_agent(
+                        root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                        router_url="unused", timeout=30.0, dry_run=False,
+                        on_chunk=lambda _p: None, native_tool_calling=True,
+                    )
+            self.assertEqual(steps, 2)
+            tool_message = self.calls[1][-1]
+            self.assertEqual(tool_message["role"], "tool")
+            self.assertIn("Approach A", tool_message["content"])
+
+    def test_unparseable_arguments_are_retried_not_crashed_on(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = [
+                _native_result(tool_calls=[{"id": "call_1", "name": "write_file", "arguments": None}], finish_reason="tool_calls"),
+                _native_result(content="Done, gave up on that approach.", finish_reason="stop"),
+            ]
+            with patch.object(builder_agent, "stream_chat_native", self._fake_stream(*results)):
+                report, steps, _touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None, native_tool_calling=True,
+                )
+            self.assertEqual(steps, 2)
+            self.assertIn("Done", report)
+
+    def test_empty_response_is_retried_not_mistaken_for_completion(self) -> None:
+        results = [
+            _native_result(content="   "),
+            _native_result(content="Done, nothing to do.", finish_reason="stop"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(builder_agent, "stream_chat_native", self._fake_stream(*results)):
+                report, steps, _touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None, native_tool_calling=True,
+                )
+            self.assertEqual(steps, 2)
+            self.assertIn("Done", report)
+
+    def test_max_steps_is_a_hard_cap_not_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            always_calling = self._fake_stream(*(
+                _native_result(tool_calls=[{"id": f"call_{i}", "name": "run_command", "arguments": {"command": "echo hi"}}], finish_reason="tool_calls")
+                for i in range(5)
+            ))
+            with patch.object(builder_agent, "stream_chat_native", always_calling):
+                report, steps, _touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=5, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None, native_tool_calling=True,
+                )
+            self.assertEqual(steps, 5)
+            self.assertIn("Stopped after 5 steps", report)
+
+
 if __name__ == "__main__":
     unittest.main()

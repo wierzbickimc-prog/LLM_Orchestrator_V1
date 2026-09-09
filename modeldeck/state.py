@@ -290,6 +290,7 @@ def _role(
     preserve_thinking: str = "auto",
     sampling_mode: str = "thinking",
     max_steps: int = 0,
+    native_tool_calling: bool = False,
 ) -> dict[str, Any]:
     sampling = sampling_preset(model, sampling_mode) or dict(_GENERIC_SAMPLING_FALLBACK)
     return {
@@ -303,6 +304,18 @@ def _role(
         # a Renovator pass hit its 40-turn cap mid-repair and reported
         # "stopped after 40 steps without the model signaling completion".
         "max_steps": max_steps,
+        # False (default) keeps the hand-rolled ```tool convention this
+        # project normally uses -- see report_common.stream_chat's
+        # docstring for why native tool-calling isn't the default: it
+        # broke going through mtplx's --tool-prompt-mode *hybrid* bridge
+        # once already. True launches this role with --tool-prompt-mode
+        # native --reasoning-parser qwen3 (see mtplx.py's model_command)
+        # and routes Builder/Renovator through stream_chat_native instead
+        # -- for a model actually trained on tool-calling (confirmed
+        # working live for Ornith-1.5), the hand-rolled convention can be
+        # the worse fit, not a neutral default. Meaningless for the
+        # one-shot roles (scout/planner/auditor), same as max_steps.
+        "native_tool_calling": native_tool_calling,
         "context_window": context_window,
         "kv_quantization": kv_quantization,
         "depth": depth,

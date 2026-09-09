@@ -22,7 +22,7 @@ import json
 import sys
 from pathlib import Path
 
-from builder_tools import ToolCallParseError, extract_tool_call, run_tool
+from builder_tools import OPENAI_TOOL_SCHEMA, ToolCallParseError, extract_tool_call, run_tool
 from report_common import (
     DEFAULT_ROUTER_URL,
     ReportError,
@@ -31,6 +31,7 @@ from report_common import (
     resolve_ai_path,
     write_report,
     stream_chat,
+    stream_chat_native,
 )
 
 DEFAULT_MAX_STEPS = 80
@@ -143,6 +144,67 @@ already have everything it contains.
 Implementation plan:
 {plan}"""
 
+# Same substance as SYSTEM_PROMPT_TEMPLATE above, for a role launched with
+# native_tool_calling=True (--tool-prompt-mode native at the server level --
+# see modeldeck/mtplx.py's model_command). The only real difference is the
+# opening paragraph: telling a model that already has a working tools
+# field "you have no tool-calling API, use this fenced-block convention
+# instead" is actively wrong here and risks it trying to satisfy both
+# conventions at once. Splitting-large-writes and test-before-finishing
+# guidance carry over unchanged -- neither is specific to how the call
+# itself is transmitted.
+SYSTEM_PROMPT_TEMPLATE_NATIVE = """You are a careful software engineer implementing an \
+already-approved plan. Implement only what the plan below calls for -- do not \
+expand scope, and do not edit anything the plan doesn't mention.
+
+Use the read_file, write_file, append_file, and run_command tools to take \
+action. ask_question pauses this session and puts your question in front of \
+the person who launched this run -- "options" is optional (omit it for a \
+free-text answer). Use it sparingly, only when the plan is genuinely silent \
+on a decision AND guessing wrong would be costly or hard to undo (e.g. an \
+irreversible destructive command, a choice between two incompatible designs \
+the plan didn't resolve). For anything else -- naming, minor structure, \
+small ambiguities a competent engineer would just resolve -- use your best \
+judgment and note the decision in your final report instead of asking. \
+Every ask_question call costs the person's attention; don't spend it on \
+things you can reasonably decide yourself.
+
+All paths are relative to the project root and must stay within it. \
+write_file replaces the entire file -- always read a file before changing \
+part of it, and reproduce every part you are not changing. If a file you're \
+writing is large, do not try to send it all in one write_file call: use \
+write_file for the first part and one or more append_file calls for the \
+rest, each small enough to comfortably fit in a single response.
+
+Call only one tool per turn, then wait for its result before the next one.
+
+Before you finish, you must actually RUN the tests with run_command and see \
+them pass. Not read them, not reason about whether they would pass -- run \
+them and look at the output. If the project has no obvious test command, \
+run whatever does exercise the change (an import, a script, a build) and \
+say in your report what you ran and what it proved. Tests you wrote but \
+never executed are the single most common way a run like this fails: they \
+are written against the code you *intended*, and the mismatches are exactly \
+the ones you cannot see by re-reading your own work. When a test fails, fix \
+it and run again -- a failing suite is not something to hand off with an \
+explanation attached.
+
+When the plan is implemented and you have seen the tests pass, reply with \
+plain text and call no tool: a summary of what you did, files changed, the \
+verification commands you ran with their actual output, and any \
+discrepancies from the plan. If you are ending without a green test run, \
+say so in the first line of that report and state exactly what is failing \
+-- do not describe the work as verified, complete, or passing when you have \
+not watched it pass. That plain-text reply ends the session, so do not send \
+it until you are actually done.
+
+The complete implementation plan is already included below in full -- do \
+not spend a turn reading it again from .ai/implementation-plan.md, you \
+already have everything it contains.
+
+Implementation plan:
+{plan}"""
+
 
 def run_agent(
     root: Path,
@@ -155,6 +217,7 @@ def run_agent(
     dry_run: bool,
     on_chunk,
     model_alias: str = "builder",
+    native_tool_calling: bool = False,
 ) -> tuple[str, int, list[str]]:
     """Returns (final_report_text, steps_taken, touched_files) -- touched_files
     is every relative path passed to write_file/append_file this run (deduped,
@@ -165,7 +228,19 @@ def run_agent(
     different backend: Builder and Renovator are deliberately on different
     models (fast MoE for the bulk pass, dense for expert cleanup -- see the
     role comments in modeldeck/state.py), which they can't be while sharing
-    one alias."""
+    one alias.
+
+    native_tool_calling dispatches to a separate loop (_run_agent_native)
+    rather than branching step-by-step in this one -- the two conventions
+    differ enough in message shape (OpenAI tool_calls/tool-role messages
+    vs. a single fenced JSON block in plain assistant text) that interleaving
+    them here would make both harder to read and to trust. The proven,
+    default path below is untouched by this parameter existing at all."""
+    if native_tool_calling:
+        return _run_agent_native(
+            root, plan, task, max_steps, command_timeout, router_url, timeout,
+            dry_run, on_chunk, model_alias,
+        )
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(plan=plan)
     user_intro = "Begin." if not task else f"Begin. Additional note from the requester:\n{task}"
     messages: list[dict[str, str]] = [
@@ -288,6 +363,141 @@ def run_agent(
     )
 
 
+def _run_agent_native(
+    root: Path,
+    plan: str,
+    task: str,
+    max_steps: int,
+    command_timeout: float,
+    router_url: str,
+    timeout: float,
+    dry_run: bool,
+    on_chunk,
+    model_alias: str,
+) -> tuple[str, int, list[str]]:
+    """The native-tool-calling counterpart to run_agent's default loop --
+    see that function's native_tool_calling docstring note for why this is
+    a separate loop rather than an inline branch. Message history follows
+    the OpenAI convention throughout: an assistant turn that calls tools
+    carries content=None and a tool_calls list; each tool's result comes
+    back as its own {"role": "tool", "tool_call_id": ..., "content": ...}
+    message, not the single "user"-role prose message the default loop
+    uses."""
+    system_prompt = SYSTEM_PROMPT_TEMPLATE_NATIVE.format(plan=plan)
+    user_intro = "Begin." if not task else f"Begin. Additional note from the requester:\n{task}"
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_intro},
+    ]
+    touched: set[str] = set()
+    consecutive_parse_failures = 0
+
+    for step in range(1, max_steps + 1):
+        on_chunk(f"\n--- step {step} ---\n")
+        result = stream_chat_native(
+            model_alias, messages, OPENAI_TOOL_SCHEMA, on_chunk=on_chunk,
+            router_url=router_url, timeout=timeout, max_tokens=MAX_COMPLETION_TOKENS,
+        )
+        content = result["content"]
+        tool_calls = result["tool_calls"]
+
+        if not tool_calls:
+            if not content.strip():
+                # Same empty-turn guard as the default loop -- an empty
+                # response is never a legitimate "I'm done" signal, native
+                # mode included.
+                on_chunk(
+                    "\n[empty response -- likely cut off mid-thought by the "
+                    "completion-token cap before producing anything; retrying]\n"
+                )
+                messages.append({
+                    "role": "user",
+                    "content": "Your last response was empty -- it looks like you were cut off "
+                    "before producing any output. Get to the point sooner: call a tool for the "
+                    "next concrete action, or, if you are actually done, give your plain-text "
+                    "summary directly without a long lead-in.",
+                })
+                continue
+            return content, step, sorted(touched)
+
+        messages.append({
+            "role": "assistant",
+            "content": content or None,
+            "tool_calls": [
+                {
+                    "id": tc["id"] or f"call_{step}_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["arguments"]) if tc["arguments"] is not None else "",
+                    },
+                }
+                for i, tc in enumerate(tool_calls)
+            ],
+        })
+
+        any_parse_failure = False
+        for i, tc in enumerate(tool_calls):
+            call_id = tc["id"] or f"call_{step}_{i}"
+            if tc["arguments"] is None:
+                # The accumulated arguments string didn't parse as JSON --
+                # most likely truncated by MAX_COMPLETION_TOKENS on a large
+                # write_file/append_file, the same failure mode the default
+                # loop's escalation logic exists for.
+                any_parse_failure = True
+                consecutive_parse_failures += 1
+                on_chunk(f"\n[invalid tool call arguments ({consecutive_parse_failures} in a row) for {tc['name']}]\n")
+                if consecutive_parse_failures >= CONSECUTIVE_FAILURES_BEFORE_ESCALATION:
+                    feedback = (
+                        f"That's {consecutive_parse_failures} failed attempts in a row with "
+                        f"unparseable arguments for {tc['name']}. Stop retrying it as-is. Whatever "
+                        "you're writing is too large for one response -- split it now: a "
+                        "write_file call for roughly the first half of the content, then one or "
+                        "more append_file calls for the rest, each small enough to comfortably "
+                        "fit in a single response on its own."
+                    )
+                else:
+                    feedback = f"Your arguments for {tc['name']} were not valid JSON. Try again."
+                messages.append({"role": "tool", "tool_call_id": call_id, "content": feedback})
+                continue
+
+            if tc["name"] == "ask_question":
+                question = str(tc["arguments"].get("question") or "")
+                options = tc["arguments"].get("options")
+                marker = json.dumps({
+                    "question": question,
+                    "options": options if isinstance(options, list) else None,
+                })
+                on_chunk(f"\n[ASK_QUESTION] {marker}\n")
+                answer = input().strip()
+                on_chunk(f"[answered: {answer}]\n")
+                messages.append({
+                    "role": "tool", "tool_call_id": call_id,
+                    "content": f"The person running this session answered: {answer}",
+                })
+                continue
+
+            call = {"name": tc["name"], "arguments": tc["arguments"]}
+            tool_result = run_tool(call, root, command_timeout, dry_run)
+            on_chunk(f"\n[{tc['name']} -> {len(tool_result)} chars]\n")
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": tool_result})
+            if tc["name"] in ("write_file", "append_file") and not dry_run:
+                path = tc["arguments"].get("path")
+                if isinstance(path, str):
+                    touched.add(path)
+
+        if not any_parse_failure:
+            consecutive_parse_failures = 0
+
+    return (
+        f"Stopped after {max_steps} steps without the model signaling completion. "
+        "This is a safety cap, not a crash -- review the transcript above; the plan "
+        "may need to be smaller, or max-steps raised.",
+        max_steps,
+        sorted(touched),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("path", type=Path, help="project directory to work in")
@@ -301,6 +511,12 @@ def main() -> int:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="run the loop but log intended writes/commands instead of executing them",
+    )
+    parser.add_argument(
+        "--native-tool-calling", action="store_true",
+        help="use OpenAI-style tool_calls instead of the ```tool convention -- only works if "
+        "the role's model server was launched with --tool-prompt-mode native (see "
+        "modeldeck/state.py's native_tool_calling role flag)",
     )
     args = parser.parse_args()
 
@@ -325,6 +541,7 @@ def main() -> int:
             args.path, plan, args.task, args.max_steps, args.command_timeout,
             args.router_url, args.timeout, args.dry_run,
             on_chunk=lambda piece: print(piece, end="", flush=True),
+            native_tool_calling=args.native_tool_calling,
         )
     except ReportError as exc:
         print(str(exc), file=sys.stderr)

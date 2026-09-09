@@ -39,6 +39,92 @@ VALID_TOOLS = {"read_file", "write_file", "run_command", "append_file", "ask_que
 # which run_tool has no way to do (it's a pure request/response function
 # with no access to the agent loop's on_chunk or stdin handling).
 
+# Same five actions as the ```tool convention above, expressed as OpenAI
+# function-calling schema -- for the native-tool-calling path (see
+# report_common.stream_chat_native), used only for roles configured with
+# native_tool_calling=True. Kept as one hand-written source next to
+# VALID_TOOLS/run_tool rather than generated, since there are only five and
+# generation would just move the same information one layer further from
+# where it's actually consumed.
+OPENAI_TOOL_SCHEMA: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the full contents of a file at a path relative to the project root.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Relative file path"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Replace the entire contents of a file at a path relative to the project root, creating it if it doesn't exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative file path"},
+                    "content": {"type": "string", "description": "The full new file content"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": "Append content to the end of a file at a path relative to the project root.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative file path"},
+                    "content": {"type": "string", "description": "Content to add to the end"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command in the project root and return its combined stdout/stderr and exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "Shell command, e.g. pytest"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_question",
+            "description": (
+                "Pause and ask the person running this session a question. Use sparingly -- only "
+                "when the plan is genuinely silent on a decision AND guessing wrong would be costly "
+                "or hard to undo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The decision you need"},
+                    "options": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Optional fixed choices; omit for a free-text answer",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+]
+
 
 class ToolCallParseError(Exception):
     """The model's response didn't contain a valid tool call. Callers feed
