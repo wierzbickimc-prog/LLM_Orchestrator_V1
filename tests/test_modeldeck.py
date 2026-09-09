@@ -25,7 +25,9 @@ class StateTests(unittest.TestCase):
             self.assertEqual(loaded["planner"]["model"], "gpt-test")
             self.assertEqual(loaded["roles"]["scout"]["kv_quantization"], "q8")
             self.assertEqual(loaded["roles"]["scout"]["preserve_thinking"], "auto")
-            self.assertEqual(loaded["roles"]["builder"]["kv_quantization"], "q8")
+            # Builder is now the MoE-family choice (Qwen3.6 Balance), kv off
+            # by design -- see the benchmark-backed comment in state.py.
+            self.assertEqual(loaded["roles"]["builder"]["kv_quantization"], "off")
             self.assertEqual(loaded["roles"]["builder"]["preserve_thinking"], "auto")
 
     def test_phase_activation_builds_expected_backend(self) -> None:
@@ -83,10 +85,25 @@ class CommandTests(unittest.TestCase):
     def test_builder_keeps_shared_cache_and_thinking_defaults(self) -> None:
         role = default_state()["roles"]["builder"]
         command, _ = model_command("builder", role, Path("/mtplx"))
+        # kv off, not q8: Builder is the MoE-family choice (Qwen3.6 Balance),
+        # benchmarked to prefer full-precision KV -- see state.py's comment.
         quant_index = command.index("--paged-kv-quantization")
-        self.assertEqual(command[quant_index + 1], "q8")
+        self.assertEqual(command[quant_index + 1], "off")
         preserve_index = command.index("--preserve-thinking")
         self.assertEqual(command[preserve_index + 1], "auto")
+
+    def test_profile_derives_from_model_family_not_a_flat_default(self) -> None:
+        # This used to be a single hardcoded "turbo" for every role
+        # regardless of model -- silently wrong for every MoE role
+        # (scout/chat/prompt_dev included) until caught. Pin the fix: MoE
+        # families get "sustained" (their own recommended_profile, per
+        # mtplx's installed_models()), the dense family gets "turbo".
+        roles = default_state()["roles"]
+        self.assertEqual(roles["scout"]["profile"], "sustained")
+        self.assertEqual(roles["builder"]["profile"], "sustained")
+        self.assertEqual(roles["auditor"]["profile"], "sustained")
+        self.assertEqual(roles["renovator"]["profile"], "turbo")
+        self.assertEqual(roles["planner"]["profile"], "turbo")
 
 
 if __name__ == "__main__":

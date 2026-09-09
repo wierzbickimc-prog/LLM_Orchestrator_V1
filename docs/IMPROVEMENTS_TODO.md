@@ -111,6 +111,45 @@ the way it is.
 
 ## Done
 
+- **Set Builder/Auditor to Qwen3.6 Balance and Planner/Renovator to
+  Qwen3.8 Quality, backed by the full 5-model x 2-convention benchmark**
+  (see the native-tool-calling and harder-task entries above). Neither
+  "Speed" variant won: on the same task, same mode, the non-Speed variant
+  of both families was faster AND had fewer self-inflicted errors to
+  recover from -- not a tradeoff. Qwen3.6 Balance ran clean in one shot
+  under native tool-calling (247s); Speed crashed on its first attempt
+  (an `ask_question` call with no answerer wired up) and took 373s on
+  retry. Qwen3.8 Quality was faster in both conventions tested
+  (1,072s/772s vs. Speed's 1,963s/1,517s) and had zero self-correction
+  incidents across both runs; Speed's native run corrupted three
+  pre-existing tests during a rewrite and had to recover via `git diff`/
+  `git checkout`.
+
+  Builder and Renovator also get `native_tool_calling=True` now (Auditor
+  and Planner deliberately don't -- both are one-shot `call_model()`
+  requests with no tool loop to route through it, so the flag would be a
+  no-op there). Renovator's native flag isn't independently benchmarked
+  for the Renovator role specifically, but it reuses Builder's exact loop,
+  and Qwen3.8 Quality's best Builder-role result in the whole matrix
+  (772s, zero errors, found the actual root cause of a real test-runner
+  bug) was under native mode -- revisit if a Renovator-specific run
+  disagrees.
+
+  Fixed a real bug caught while wiring this up: `_role()`'s `profile` was
+  a single hardcoded `"turbo"` regardless of model -- silently wrong for
+  every MoE role (scout/chat/prompt_dev included, not just the ones this
+  change touches) since `"turbo"` is compiled/verified against the dense
+  27B/9B flagships specifically. Now derived from `model_family()`
+  (`_PROFILE_BY_FAMILY`), confirmed against mtplx's own
+  `recommended_profile` per model rather than assumed, so it can't drift
+  silently again the way the flat default did. Scout/Chat/PromptDev now
+  correctly get `"sustained"` too, as a side effect of fixing the
+  mechanism rather than a deliberate change to those roles.
+
+  213 tests pass (2 pre-existing assertions updated to the new defaults,
+  1 new test pinning the profile-derives-from-family fix).
+
+
 - **Added an opt-in native tool-calling path, and it fixed a real Ornith
   failure the hand-rolled convention couldn't.** This project has always
   avoided sending an OpenAI `tools` field (see report_common.stream_chat's

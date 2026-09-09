@@ -13,6 +13,20 @@ DEFAULT_BUILDER = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16"
 # Same MoE class as DEFAULT_SCOUT (35B total, ~3B active), benchmarked
 # head-to-head against it -- see docs/IMPROVEMENTS_TODO.md for the protocol.
 DEFAULT_ORNITH = "philipjohnbasile/ornith-ai-Ornith-1.5-35B-A3B-V2-MTPLX"
+# Chosen for Builder/Auditor and Planner/Renovator respectively after the
+# full 5-model x 2-convention benchmark on the deliberately harder
+# structural-save task (see docs/IMPROVEMENTS_TODO.md). Not the "Speed"
+# variant of either family: on the same task, in the same mode, the
+# non-Speed variant of both families won by a real margin -- faster AND
+# fewer self-inflicted errors to recover from, not a tradeoff between the
+# two. Qwen3.6 Balance ran clean in one shot (247s); Speed needed a retry
+# after an ask_question crash and took 373s. Qwen3.8 Quality was faster in
+# both tool-calling conventions tested (1,072s/772s vs. Speed's
+# 1,963s/1,517s) and had zero self-correction incidents across both runs;
+# Speed's native run corrupted three pre-existing tests during a rewrite
+# and had to recover via git diff/git checkout.
+DEFAULT_QWEN36_BALANCE = "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance-FP16"
+DEFAULT_QWEN38_QUALITY = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16"
 
 # Officially published sampling parameters per model card -- these are not
 # guesses, and generic defaults (e.g. temperature=0.7/top_p=0.9 for
@@ -168,48 +182,48 @@ def default_state() -> dict[str, Any]:
                 DEFAULT_SCOUT, 8000, "auto", "medium", 131_072, 3,
                 sampling_mode="thinking",
             ),
-            # Builder on the MoE (~3B active params/token): the bulk of a
-            # build is mechanical volume -- read a file, write it back,
-            # run the tests -- and Builder's errors are among the cheapest
-            # in the pipeline to catch, since Auditor reads the whole tree
-            # afterward and a REJECT costs one Renovator pass, not a
-            # rebuild. Paired with the dense model on Renovator below: fast
-            # bulk pass, expert cleanup. UNVALIDATED as of this change --
-            # every tool-call pathology seen so far (missing/stripped
-            # ```tool fences) was on the dense model's "tokenizer" chat
-            # template, and we have no evidence either way about how the
-            # MoE's "local_qwen36" template behaves in a long tool-use
-            # loop, because scout/auditor never emit tool calls. Benchmark
-            # before trusting it -- see docs/IMPROVEMENTS_TODO.md.
-            #
-            # reasoning="auto" + thinking_precise, not "off"+instruct
-            # (EXPERIMENT, live): a first live attempt on reasoning="off"
-            # produced a single clean sentence announcing intent ("I'll
-            # start by reading... let me begin by reading the key files")
-            # and then no tool call at all -- not truncated, not malformed,
-            # just no follow-through, on the model's very first turn, zero
-            # files touched. reasoning="off"+instruct is exactly what the
-            # dense model used successfully every time, so the model is the
-            # only thing that changed -- but Qwen3.6 is a different
-            # architecture (MoE, not dense) and may need actual reasoning
-            # space to commit to an action, where the dense model didn't.
-            # Testing that theory in isolation: only this pairing changed,
-            # nothing else. If it doesn't fix the no-follow-through pattern,
-            # revert to reasoning="off"/instruct and treat this model as
-            # not viable for Builder's tool loop -- see
-            # docs/IMPROVEMENTS_TODO.md for the outcome either way.
+            # Qwen3.6 Balance, native tool-calling, MoE-correct serving
+            # parameters -- see DEFAULT_QWEN36_BALANCE's comment for the
+            # benchmark this is based on. profile="sustained" (not "turbo":
+            # this model's own recommended_profile, confirmed via mtplx's
+            # installed_models() -- turbo is compiled/verified against the
+            # dense 27B/9B flagships specifically, not this architecture).
+            # kv_quantization="off": MoE models are reportedly more
+            # sensitive to KV-cache quantization than dense ones, and the
+            # cost is cheap here -- this architecture's hybrid
+            # linear/full-attention design (full_attention_interval=4, only
+            # 2 KV heads) keeps full-precision KV under ~2.5GB even at
+            # 131K context, not the tens of GB a classic dense-attention
+            # model would need. depth=1: mtplx's own `tune` data (see
+            # docs/DEPTH_TUNING.md) shows deeper speculation actively hurts
+            # this model -- depth 3's third-position acceptance craters to
+            # ~1-30%, making depth 3 slower than plain autoregressive
+            # decode, not just slower than depth 1.
+            # native_tool_calling=True: this model is trained for tool use,
+            # and forcing it onto the hand-rolled ```tool convention meant
+            # for a different model is a real cost, not a neutral default
+            # -- see the native_tool_calling comment in _role() below.
             "builder": _role(
-                DEFAULT_SCOUT, 8002, "auto", "medium", 131_072, 3,
-                sampling_mode="thinking_precise", max_steps=80,
+                DEFAULT_QWEN36_BALANCE, 8002, "auto", "medium", 131_072, 1,
+                kv_quantization="off", sampling_mode="thinking_precise",
+                max_steps=80, native_tool_calling=True,
             ),
             # Renovator gets its own role rather than reusing Builder's, so
-            # the two can run different models. Deliberately left on
-            # reasoning="off" + instruct, matching Builder's proven
-            # tool-loop config: the point of this split is to test the
-            # *model* variable on its own. Thinking mode here is a separate
-            # question worth its own benchmark -- reasoning tokens in a
-            # tool-call loop are exactly the kind of interaction that has
-            # bitten this project before, so don't change both at once.
+            # the two can run different models -- Qwen3.8 Quality here,
+            # same benchmark as Builder's Qwen3.6 Balance choice (see
+            # DEFAULT_QWEN38_QUALITY's comment). profile="turbo" (this
+            # family's own recommended_profile, unlike Qwen3.6's), depth=3
+            # (mtplx tune: Quality's third-position acceptance holds at
+            # 92%, unlike the MoE models' collapse -- deeper speculation
+            # actually pays off here). kv_quantization="q8": dense models
+            # weren't the ones flagged as KV-quant sensitive, and q8 halves
+            # the KV footprint for no observed quality cost.
+            # native_tool_calling=True: not explicitly benchmarked for
+            # Renovator specifically, but Renovator reuses Builder's exact
+            # loop, and Qwen3.8 Quality's own best Builder-role run in the
+            # whole matrix (772s, zero self-correction incidents, found
+            # the actual root cause of a real test-runner bug) was under
+            # native mode. Revisit if a Renovator-specific run disagrees.
             # max_steps=80, matching Builder: 40 was not enough. A repair
             # pass hit the cap on a four-item fix list and reported
             # "stopped after 40 steps without the model signaling
@@ -217,35 +231,46 @@ def default_state() -> dict[str, Any]:
             # original build, because it starts by re-reading files it did
             # not write in this session.
             "renovator": _role(
-                DEFAULT_BUILDER, 8006, "off", "auto", 131_072, 3,
-                sampling_mode="instruct", max_steps=80,
+                DEFAULT_QWEN38_QUALITY, 8006, "off", "auto", 131_072, 3,
+                kv_quantization="q8", sampling_mode="instruct",
+                max_steps=80, native_tool_calling=True,
             ),
             # Auditor's actual job is breadth (scan the whole tree for
             # out-of-scope changes), not narrow depth on a few files -- that's
-            # exactly what scout's MoE model (~3B active params/token) is
-            # built for, and it's markedly faster at a full-tree scan than
-            # the dense 27B model here previously. Reuses scout's model on a
-            # separate port/session-bank so scout and auditor can still run
-            # as distinct resident processes if ever needed concurrently.
+            # exactly what the MoE model (~3B active params/token) is
+            # built for. Same model as Builder (Qwen3.6 Balance) for the
+            # same benchmark-backed reasons -- see DEFAULT_QWEN36_BALANCE's
+            # comment and the Builder role above. sustained/kv-off/depth=1
+            # for the same MoE-architecture reasons as Builder.
+            # native_tool_calling is meaningless here and deliberately left
+            # unset: auditor_report.py is a one-shot call_model() request,
+            # never the agentic tool loop -- there's no tool-calling
+            # convention for this role to use at all, native or otherwise.
             # sampling_mode="thinking_precise": auditor's job is close code
             # review, which is exactly what Qwen3.6's coding-tuned thinking
             # preset is for, as opposed to scout's more general investigation.
             "auditor": _role(
-                DEFAULT_SCOUT, 8004, "auto", "medium", 131_072, 3,
-                sampling_mode="thinking_precise",
+                DEFAULT_QWEN36_BALANCE, 8004, "auto", "medium", 131_072, 1,
+                kv_quantization="off", sampling_mode="thinking_precise",
             ),
             # Planner's own role (port 8008), no longer borrowing another
-            # phase's. Deliberately identical in model/reasoning/sampling to
-            # what it inherited from "renovator" before this split, so the
-            # change is purely structural with no behavioral delta to
-            # confound a benchmark. Worth noting for a *separate*
-            # experiment: reasoning="off" is arguably a mismatch for a pure
-            # design step (it was inherited from a tool-loop role, where off
-            # is right), and now that this is its own role that's a one-
-            # dropdown change in the Deck tab instead of a config surgery.
+            # phase's. Qwen3.8 Quality for the same benchmark-backed reasons
+            # as Renovator -- see DEFAULT_QWEN38_QUALITY's comment. Planning
+            # is the step with the least downstream error correction in
+            # this pipeline (Builder implements the plan faithfully,
+            # Auditor checks compliance *with* the plan, so nothing
+            # downstream questions its premises), which makes the fastest,
+            # most error-free model of the pair the right one here too --
+            # even though "fewer self-correction incidents" isn't directly
+            # observable for a one-shot call the way it is for an agentic
+            # loop, Quality's better result held in every mode tested.
+            # turbo/kv-q8/depth=3 for the same dense-architecture reasons
+            # as Renovator. native_tool_calling deliberately unset: like
+            # Auditor, this is a one-shot planner_report.py/call_model()
+            # request with no tool loop to route through it.
             "planner": _role(
-                DEFAULT_BUILDER, 8008, "off", "auto", 131_072, 3,
-                sampling_mode="instruct",
+                DEFAULT_QWEN38_QUALITY, 8008, "off", "auto", 131_072, 3,
+                kv_quantization="q8", sampling_mode="instruct",
             ),
             # Not a pipeline phase: this backs the Chat tab, where a prompt
             # gets talked through and sharpened *before* it is handed to
@@ -279,6 +304,24 @@ def default_state() -> dict[str, Any]:
     }
 
 
+# mtplx serve profiles: "turbo" is the compiled/verified kernel path built
+# for the quantized dense 27B/9B flagships specifically; "sustained" is the
+# long-context MTP path (chunked prefill, request-sized KV) that's the
+# actual default for everything else, MoE included. Confirmed directly
+# from mtplx's own installed_models() `recommended_profile` field per
+# model, not inferred: every Qwen3.6-35B-A3B and Ornith-1.5-35B variant
+# reports "sustained", every Qwen3.8-27B variant reports "turbo". This
+# used to be a single hardcoded "turbo" default below regardless of model
+# -- silently wrong for every MoE role (scout/chat/prompt_dev included)
+# until that was caught. Deriving it from the family instead of a literal
+# means it can't drift the same way again as new roles get added.
+_PROFILE_BY_FAMILY = {
+    "Qwen3.6-35B": "sustained",
+    "Ornith-1.5-35B": "sustained",
+    "Qwen3.8-27B": "turbo",
+}
+
+
 def _role(
     model: str,
     port: int,
@@ -291,8 +334,10 @@ def _role(
     sampling_mode: str = "thinking",
     max_steps: int = 0,
     native_tool_calling: bool = False,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     sampling = sampling_preset(model, sampling_mode) or dict(_GENERIC_SAMPLING_FALLBACK)
+    resolved_profile = profile or _PROFILE_BY_FAMILY.get(model_family(model) or "", "turbo")
     return {
         "model": model,
         "port": port,
@@ -356,7 +401,7 @@ def _role(
         # lifetime, cleared on every relaunch) doesn't have this problem.
         "ssd_session_cache": "off",
         "fan_mode": "smart",
-        "profile": "turbo",
+        "profile": resolved_profile,
         "prefill_chunk_tokens": 2048,
     }
 
