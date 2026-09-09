@@ -10,6 +10,9 @@ from typing import Any
 SCHEMA_VERSION = 1
 DEFAULT_SCOUT = "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
 DEFAULT_BUILDER = "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16"
+# Same MoE class as DEFAULT_SCOUT (35B total, ~3B active), benchmarked
+# head-to-head against it -- see docs/IMPROVEMENTS_TODO.md for the protocol.
+DEFAULT_ORNITH = "philipjohnbasile/ornith-ai-Ornith-1.5-35B-A3B-V2-MTPLX"
 
 # Officially published sampling parameters per model card -- these are not
 # guesses, and generic defaults (e.g. temperature=0.7/top_p=0.9 for
@@ -44,6 +47,25 @@ SAMPLING_PRESETS: dict[str, dict[str, dict[str, float]]] = {
     },
 }
 
+# Ornith-1.5-35B-A3B publishes its own preset numbers, but they are
+# numerically identical to Qwen3.6-35B's across all three modes (confirmed
+# by comparing the published values directly, not assumed from the shared
+# Qwen lineage). Aliased to the same dict object rather than duplicated, so
+# the two can never silently drift apart the way DEFAULT_CHAR_BUDGET did
+# when nothing forced it to track context_window -- see
+# scripts/report_common.py's char_budget_for_role docstring for that
+# incident. sampling_preset()/model_family() never mutate these dicts, so
+# sharing one object across two families is safe.
+#
+# One real published difference, not captured by these three named modes:
+# Ornith has no way to fully disable reasoning (it always opens with
+# <think>), so there is no equivalent of an "off"-paired instruct mode the
+# way Qwen's instruct preset pairs with reasoning="off". Builder/Renovator
+# roles assigned to Ornith will run with reasoning on regardless of which
+# sampling_mode is selected -- a real cost/quality tradeoff to watch in the
+# benchmark, not a configuration bug to fix.
+SAMPLING_PRESETS["Ornith-1.5-35B"] = SAMPLING_PRESETS["Qwen3.6-35B"]
+
 _GENERIC_SAMPLING_FALLBACK = {
     "temperature": 0.7, "top_p": 0.9, "top_k": 40, "min_p": 0.0,
     "presence_penalty": 0.0, "repetition_penalty": 1.0,
@@ -55,6 +77,8 @@ def model_family(model_repo_id: str) -> str | None:
         return "Qwen3.8-27B"
     if "Qwen3.6-35B" in model_repo_id:
         return "Qwen3.6-35B"
+    if "Ornith-1.5-35B" in model_repo_id:
+        return "Ornith-1.5-35B"
     return None
 
 

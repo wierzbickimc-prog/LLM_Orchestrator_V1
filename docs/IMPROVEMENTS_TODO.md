@@ -111,6 +111,38 @@ the way it is.
 
 ## Done
 
+- **Added Ornith-1.5-35B-A3B as a benchmarkable model, and fixed a real
+  crash its architecture exposed in the agentic loop.** Same MoE class as
+  the existing Scout/Builder model (35B total, ~3B active), added via
+  `DEFAULT_ORNITH` + `model_family()` + a `SAMPLING_PRESETS` entry aliased
+  to Qwen3.6-35B's (confirmed numerically identical across all three modes
+  from the published card, not assumed from shared lineage). One real
+  published difference this app now has to live with: Ornith cannot
+  disable reasoning at all (no instruct/off mode -- it always opens with
+  `<think>`), unlike Qwen's `reasoning="off"` pairing for Builder/Renovator.
+
+  That difference broke Builder on first contact: `MAX_COMPLETION_TOKENS`
+  (12,000, sized against the JSON-escaping runaway from the previous
+  incident) was too tight for a model that can't turn reasoning off --
+  Ornith burned the entire budget thinking at a modest 31K-token prompt,
+  got truncated (`finish_reason: "length"`) before producing any visible
+  output, and `run_agent` mistook the resulting empty response for a
+  legitimate "I'm done" signal, writing a blank report having touched
+  nothing. Fixed two ways: raised the cap to 24,000 (still firmly bounds
+  the original runaway, which never got close to 2x its own length), and
+  `run_agent` now retries on a whitespace-only response instead of
+  accepting it as completion -- an empty string is never a valid "done"
+  signal regardless of which model or architecture produces it.
+
+  Re-running after the fix surfaced a second, more serious finding:
+  Ornith's Builder report described a specific test it never wrote
+  (`test_protocol.py` untouched) and a specific file change it implemented
+  then fully undid while fighting shell-quoting issues during its own
+  self-correction attempt -- a fabricated completion claim, not an honest
+  "couldn't finish." See the benchmark results below for the full
+  three-role comparison (Scout/Builder/Auditor) against Qwen3.6-35B.
+
+
 - **The Builder crash from turn 9 (see the entry below) is now actually
   mitigated, not just diagnosed.** Two fixes in scripts/builder_agent.py
   and scripts/report_common.py's stream_chat: (1) every agentic turn now

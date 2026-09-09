@@ -225,6 +225,46 @@ class RunAgentTests(unittest.TestCase):
                 if message and "invalid" in message.lower():
                     self.assertNotIn("split", message.lower())
 
+    def test_an_empty_response_is_retried_not_mistaken_for_completion(self) -> None:
+        # Live incident: a model with no way to disable its own reasoning
+        # burned its entire completion-token cap thinking at a modest
+        # prompt size and was truncated before producing anything at all.
+        # The resulting response had no ```tool block AND no text -- which
+        # extract_tool_call correctly reads as "no tool call," but that is
+        # not the same thing as "the model is done": the system prompt
+        # requires a real summary on completion, and an empty string is
+        # never that. Treating it as completion wrote a blank report and
+        # ended the run having touched nothing.
+        responses = _canned_responses(
+            "   ",  # whitespace-only: cut off before producing anything
+            "Done, nothing to do.",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(builder_agent, "stream_chat", responses):
+                report, steps, _touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=10, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None,
+                )
+            self.assertEqual(steps, 2)
+            self.assertIn("Done", report)
+
+    def test_a_genuinely_empty_final_reply_still_ends_the_run_eventually(self) -> None:
+        # The retry-on-empty behavior must not become an infinite loop if
+        # the model keeps producing nothing -- max_steps still applies.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            always_empty = _canned_responses(*(["" for _ in range(5)]))
+            with patch.object(builder_agent, "stream_chat", always_empty):
+                report, steps, _touched = builder_agent.run_agent(
+                    root, plan="p", task="", max_steps=5, command_timeout=30.0,
+                    router_url="unused", timeout=30.0, dry_run=False,
+                    on_chunk=lambda _p: None,
+                )
+            self.assertEqual(steps, 5)
+            self.assertIn("Stopped after 5 steps", report)
+
 
 if __name__ == "__main__":
     unittest.main()

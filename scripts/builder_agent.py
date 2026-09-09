@@ -36,13 +36,18 @@ from report_common import (
 DEFAULT_MAX_STEPS = 80
 
 # Bounds a single turn's completion length -- see stream_chat's docstring
-# for the incident this exists to shorten, not prevent. 12,000 comfortably
-# covers a full single-shot rewrite of a large source file (observed
-# successful writes in this loop have topped out around 10-11k tokens) while
-# firmly cutting off the runaway case: the 798-second, 17,329-token turn
-# this cap is sized against never had a chance to reach that length in the
-# first place.
-MAX_COMPLETION_TOKENS = 12_000
+# for the incident this exists to shorten, not prevent. Raised from the
+# original 12,000 after a second incident: a model that cannot disable its
+# own reasoning (no instruct/off mode, reasoning is always on) burned the
+# entire 12,000-token budget thinking at a modest 31K-token prompt and was
+# truncated before producing anything -- an empty response that run_agent
+# then mistook for legitimate completion (see the empty-response check
+# below, which is the other half of that fix). 24,000 still firmly bounds
+# the original runaway case (the 798-second, 17,329-token turn this cap
+# exists to shorten would still get cut well before reaching double that
+# length) while giving an always-reasoning model enough room to actually
+# finish a thought before acting.
+MAX_COMPLETION_TOKENS = 24_000
 
 # After this many consecutive tool-call parse failures, the retry message
 # stops being the generic "try again" and starts naming the fix directly.
@@ -220,6 +225,29 @@ def run_agent(
         consecutive_parse_failures = 0
 
         if call is None:
+            if not response.strip():
+                # A response with no ```tool block AND no actual text is
+                # never a legitimate "I'm done" signal -- the system prompt
+                # requires the final reply to be a real summary. An empty
+                # response means the completion-token cap cut the turn off
+                # before the model produced anything at all (seen live: a
+                # model that cannot disable its own reasoning burned the
+                # entire MAX_COMPLETION_TOKENS budget thinking, at a modest
+                # 31K-token prompt, and never got to emit a tool call or a
+                # report). Treating that as completion silently wrote a
+                # blank report and ended the run having touched no files.
+                on_chunk(
+                    "\n[empty response -- likely cut off mid-thought by the "
+                    "completion-token cap before producing anything; retrying]\n"
+                )
+                messages.append({
+                    "role": "user",
+                    "content": "Your last response was empty -- it looks like you were cut off "
+                    "before producing any output, likely mid-reasoning. Get to the point sooner: "
+                    "take the next concrete action (a ```tool call) or, if you are actually done, "
+                    "give your plain-text summary directly without a long lead-in.",
+                })
+                continue
             return response, step, sorted(touched)
 
         if call["name"] == "ask_question":
