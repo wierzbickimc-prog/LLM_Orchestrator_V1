@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -437,13 +438,186 @@ def parse_builder_accuracy(report_text: str) -> int | None:
     return None
 
 
-def read_required_artifact(path: Path, produced_by: str) -> str:
+# Long test output eats context fast without adding much signal past a
+# point -- keep enough to see the failure, drop the rest with a clear note.
+MAX_TEST_OUTPUT_CHARS = 8_000
+DEFAULT_TEST_TIMEOUT = 120.0
+
+
+def detect_test_command(path: Path) -> str | None:
+    """Best-effort guess at how to run this project's tests, or None if
+    nothing recognizable is found -- the one-shot, tool-free phases (Auditor,
+    Diagnose) cannot run tests themselves; this is the only way their output
+    can be grounded in an actual pass/fail result instead of reasoning about
+    test *source* and guessing whether it would pass. Found live, the hard
+    way: a REJECT-worthy defect (a test that genuinely failed) got a false
+    PASS because Auditor read a model's own inconclusive prose about the test
+    and mistook "the model talked itself into believing this was fixed" for
+    "this is fixed" -- it had no way to check."""
+    root = path if path.is_dir() else path.parent
+    if (root / "Package.swift").exists():
+        return "swift test"
+    has_pytest_style_tests = any(
+        p.name.startswith("test_") or p.name.endswith("_test.py")
+        for p in root.glob("*.py")
+    ) or any(root.rglob("test_*.py")) or any(root.rglob("*_test.py"))
+    if has_pytest_style_tests:
+        venv_python = root / ".venv" / "bin" / "python"
+        python = str(venv_python) if venv_python.exists() else sys.executable
+        return f"{python} -m pytest"
+    return None
+
+
+def run_test_suite(path: Path, command: str, timeout: float) -> str:
+    """Runs command in path and returns a plain-text block describing what
+    actually happened -- exit code and (possibly truncated) combined
+    output. Never raises: a timeout or a command that itself fails to
+    launch is reported as text, same as any other test result, since a
+    test suite that can't even run is itself a finding."""
+    root = path if path.is_dir() else path.parent
     try:
-        return path.read_text()
+        result = subprocess.run(
+            command, shell=True, cwd=root, capture_output=True, text=True,
+            timeout=timeout,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        if len(output) > MAX_TEST_OUTPUT_CHARS:
+            output = output[:MAX_TEST_OUTPUT_CHARS] + f"\n...[truncated, {len(output)} chars total]"
+        return f"$ {command}\nExit code: {result.returncode}\n{output}"
+    except subprocess.TimeoutExpired:
+        return f"$ {command}\nTIMED OUT after {timeout}s -- treat this as a finding, not as \"tests pass\"."
+    except OSError as exc:
+        return f"$ {command}\nFailed to run: {exc}"
+
+
+def _git(root: Path, *args: str, timeout: float = 15.0) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"(git {' '.join(args)} failed: {exc})"
+    return (result.stdout or result.stderr or "").rstrip()
+
+
+def _git_root(path: Path) -> Path | None:
+    root = path if path.is_dir() else path.parent
+    return root if _git(root, "rev-parse", "--is-inside-work-tree") == "true" else None
+
+
+def git_changed_files(path: Path) -> set[str]:
+    """Resolved path strings for every file the target repo currently shows
+    as modified/added (working tree + staged + untracked). Empty set when
+    the target isn't a git repo. Used to sort the diagnosis context so a
+    context-budget shortfall drops the files *least* likely to hold a
+    just-introduced regression, not whatever sorts last alphabetically."""
+    root = _git_root(path)
+    if root is None:
+        return set()
+    names = _git(root, "status", "--porcelain").splitlines()
+    changed: set[str] = set()
+    for line in names:
+        # "XY <path>" or "XY <old> -> <new>" for renames.
+        name = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in name:
+            name = name.split(" -> ", 1)[1]
+        if name:
+            changed.add(str((root / name).resolve()))
+    return changed
+
+
+def git_repro_context(path: Path, *, diff_budget: int = 60_000) -> str:
+    """A snapshot of the target repo's recent history and current
+    uncommitted state, for regression diagnosis: when a previously-working
+    behavior breaks, the change that broke it is almost always the most
+    recent one, so the diff and the last several commits are the
+    highest-signal context there is -- higher than any whole-tree scan.
+
+    Returns "" when path isn't in a git repo (diagnosis then falls back to
+    reasoning from file contents alone). Never raises: a missing git binary
+    or any command failure is reported inline as text, same as a clean
+    result."""
+    root = _git_root(path)
+    if root is None:
+        return ""
+
+    working = _git(root, "diff")
+    staged = _git(root, "diff", "--cached")
+    combined = "\n".join(chunk for chunk in (working, staged) if chunk)
+    if len(combined) > diff_budget:
+        combined = combined[:diff_budget] + f"\n...[diff truncated, {len(combined)} chars total]"
+
+    sections = [
+        ("Recent commits (git log --oneline -15)", _git(root, "log", "--oneline", "-15")),
+        ("Uncommitted / untracked files (git status --porcelain)", _git(root, "status", "--porcelain")),
+        ("Uncommitted diff (working tree + staged)", combined),
+    ]
+    return "\n\n".join(f"### {title}\n{body or '(none)'}" for title, body in sections)
+
+
+# A one-shot report shorter than this is treated as a failed generation, not
+# a terse-but-valid result. Found live: Diagnose stuffed 80k prompt tokens
+# into a 108k-token window, the thinking model spent all ~28k of the
+# remaining headroom on unterminated reasoning (finish_reason "length"), and
+# zero of it reached the content channel -- write_report then wrote a 0-byte
+# file that the pipeline propagated downstream as a success.
+MIN_REPORT_CHARS = 200
+
+
+def ensure_nonempty_report(text: str, *, phase: str) -> str:
+    """Raise ReportError if the model produced nothing usable. Callers should
+    run this before write_report so an empty/truncated generation stops the
+    pipeline loudly instead of saving a blank artifact the next phase then
+    silently works around."""
+    if len(text.strip()) < MIN_REPORT_CHARS:
+        raise ReportError(
+            f"The {phase} model returned {len(text.strip())} chars of usable content "
+            f"(need >= {MIN_REPORT_CHARS}). This usually means the response hit the "
+            "token ceiling while still 'thinking' and never wrote the report body -- "
+            "shrink the prompt (fewer/only the relevant files) or lower the context "
+            "window so there is real headroom for the answer."
+        )
+    return text
+
+
+def importers_of(targets: list[Path], search_root: Path, extensions: set[str]) -> list[Path]:
+    """Files under search_root that mention any target file by name (an
+    import, require, <script src>, or bare reference). Used by the
+    diff-anchored Diagnose phase to pull in the immediate blast radius of a
+    changed file without ingesting the whole tree: if `foo.js` changed, the
+    modules that import `foo.js` are where its regression actually surfaces."""
+    names = {t.name for t in targets}
+    stems = {t.stem for t in targets}
+    target_ids = {str(t.resolve()) for t in targets}
+    hits: list[Path] = []
+    for path in collect_files(search_root, extensions):
+        if str(path.resolve()) in target_ids:
+            continue
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if any(name in text for name in names) or any(
+            re.search(rf"\b{re.escape(stem)}\b", text) for stem in stems
+        ):
+            hits.append(path)
+    return hits
+
+
+def read_required_artifact(path: Path, produced_by: str, *, allow_empty: bool = False) -> str:
+    try:
+        text = path.read_text()
     except OSError as exc:
         raise ReportError(
             f"Could not read {path} ({exc}). Run {produced_by} first -- this phase reads its output."
         ) from exc
+    if not allow_empty and not text.strip():
+        raise ReportError(
+            f"{path} exists but is empty. The phase that produces it ({produced_by}) "
+            "most likely failed to write a real report -- re-run it rather than "
+            "continuing from a blank artifact."
+        )
+    return text
 
 
 def stream_chat(
@@ -677,14 +851,22 @@ def call_model(
     on_chunk: Callable[[str], None] | None = None,
     router_url: str = DEFAULT_ROUTER_URL,
     timeout: float = 600.0,
+    max_tokens: int | None = None,
 ) -> str:
     """One-shot system+user convenience wrapper around stream_chat, for the
-    single-exchange scripts (scout/planner/auditor). Unlike stream_chat
-    itself, this raises when the response looks like a failed native
-    tool-call attempt -- there's no retry loop here to hand it to, so the
-    only options are surface it as a failure or silently save the garbled
-    text as the report. builder_agent.py doesn't go through this wrapper;
-    it calls stream_chat directly so it can retry the same failure itself."""
+    single-exchange scripts (scout/planner/auditor/diagnose). Unlike
+    stream_chat itself, this raises when the response looks like a failed
+    native tool-call attempt -- there's no retry loop here to hand it to, so
+    the only options are surface it as a failure or silently save the
+    garbled text as the report. builder_agent.py doesn't go through this
+    wrapper; it calls stream_chat directly so it can retry the same failure
+    itself.
+
+    max_tokens bounds the generation. Leave it None for the phases whose
+    prompt comfortably fits their window; set it where the prompt is large
+    relative to the context window and the model is a thinking model, so a
+    reasoning runaway stops at a bounded ceiling instead of consuming the
+    whole remaining window and emitting zero content (see Diagnose)."""
     result = stream_chat(
         model_alias,
         [
@@ -694,6 +876,7 @@ def call_model(
         on_chunk=on_chunk,
         router_url=router_url,
         timeout=timeout,
+        max_tokens=max_tokens,
     )
     if looks_like_failed_tool_call(result):
         raise ReportError(

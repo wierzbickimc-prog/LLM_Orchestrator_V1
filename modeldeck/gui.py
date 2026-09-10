@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from .mtplx import PROJECT_DIR, ProcessManager, fetch_json, fetch_sse_snapshot, installed_models, post_json
-from .pipeline import PIPELINE_ORDER, STATUS_PHASES, Pipeline
+from .pipeline import FLOW_ORDERS, STATUS_PHASES, Pipeline
 from .prompts import PROMPTS
 from .secrets import get_openai_api_key, set_openai_api_key
 from .state import (
@@ -114,9 +114,11 @@ class ReportBridge(QObject):
 
 
 class PipelinePanel(QGroupBox):
-    """One task + one path, run against all four phases either automatically
-    (Full Suite) or one phase at a time with a pause for review between each
-    (Step-by-Step) -- see MainWindow._start_pipeline and friends."""
+    """One task + one path, run against a flow's four phases (Feature:
+    Scout/Planner/Builder/Auditor; Troubleshoot: Diagnose/Planner/Builder/
+    Auditor) either automatically (Full Suite) or one phase at a time with a
+    pause for review between each (Step-by-Step) -- see
+    MainWindow._start_pipeline and friends."""
 
     def __init__(self):
         super().__init__("Pipeline")
@@ -139,13 +141,27 @@ class PipelinePanel(QGroupBox):
         self.task_field.setMinimumHeight(140)
         layout.addWidget(self.task_field)
 
+        flow_row = QHBoxLayout()
+        flow_row.addWidget(QLabel("Flow"))
+        self.flow = QComboBox()
+        self.flow.addItem("Feature", "feature")
+        self.flow.addItem("Troubleshoot", "troubleshoot")
+        self.flow.setToolTip(
+            "Feature: Scout surveys the codebase, then Planner/Builder/Auditor. "
+            "Troubleshoot: Diagnose instead of Scout -- diff-anchored, runs the "
+            "test suite, isolates the regression the last change introduced."
+        )
+        flow_row.addWidget(self.flow, 1)
+        layout.addLayout(flow_row)
+
         start_row = QHBoxLayout()
         start_row.addWidget(QLabel("Start from"))
         self.start_phase = QComboBox()
-        for phase in PIPELINE_ORDER:
-            self.start_phase.addItem(phase.title(), phase)
         start_row.addWidget(self.start_phase, 1)
         layout.addLayout(start_row)
+
+        self.flow.currentIndexChanged.connect(self._sync_start_phase)
+        self._sync_start_phase()
 
         run_row = QHBoxLayout()
         self.full_suite_button = QPushButton("Run Full Suite")
@@ -198,6 +214,19 @@ class PipelinePanel(QGroupBox):
         directory = QFileDialog.getExistingDirectory(self, "Choose a file or directory to scan")
         if directory:
             self.path_field.setText(directory)
+
+    def _sync_start_phase(self) -> None:
+        """Repopulate "Start from" with the phases of the selected flow,
+        keeping the current pick if it still exists in the new flow."""
+        previous = self.start_phase.currentData()
+        order = FLOW_ORDERS.get(str(self.flow.currentData()), FLOW_ORDERS["feature"])
+        self.start_phase.blockSignals(True)
+        self.start_phase.clear()
+        for phase in order:
+            self.start_phase.addItem(phase.title(), phase)
+        restored = self.start_phase.findData(previous)
+        self.start_phase.setCurrentIndex(restored if restored >= 0 else 0)
+        self.start_phase.blockSignals(False)
 
     def set_phase_state(self, phase: str, state: str) -> None:
         self.phase_state[phase] = state
@@ -1294,8 +1323,13 @@ class MainWindow(QMainWindow):
         heading.setObjectName("title")
         layout.addWidget(heading)
         note = QLabel(
-            "One task, one path, run against all four phases -- no chat client, no VS "
-            "Code involved. Scout/Planner/Auditor are one-shot, tool-free calls; "
+            "One task, one path, run against four phases -- no chat client, no VS "
+            "Code involved. The Feature flow is Scout/Planner/Builder/Auditor; the "
+            "Troubleshoot flow swaps Scout for Diagnose (diff-anchored: it reads "
+            "the target repo's recent git history and uncommitted diff and runs "
+            "the test suite, to isolate the regression a recent change introduced) "
+            "and Planner then works from .ai/diagnosis-report.md. Scout/Diagnose/"
+            "Planner/Auditor are one-shot, tool-free calls; "
             "Builder is a small purpose-built agent loop that actually edits "
             "files and runs commands in the target path (not sandboxed beyond "
             "that -- review .ai/implementation-plan.md once Planner finishes, "
@@ -1336,8 +1370,9 @@ class MainWindow(QMainWindow):
         path = self.pipeline_panel.path_field.text().strip()
         task = self.pipeline_panel.task_field.toPlainText().strip()
         start_phase = str(self.pipeline_panel.start_phase.currentData())
+        flow = str(self.pipeline_panel.flow.currentData())
 
-        result = self.pipeline.start(mode, path, task, start_phase)
+        result = self.pipeline.start(mode, path, task, start_phase, flow)
         if "error" in result:
             QMessageBox.information(self, "Pipeline", result["error"])
             return

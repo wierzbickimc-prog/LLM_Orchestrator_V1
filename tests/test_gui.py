@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from modeldeck.gui import RoleEditor  # noqa: E402
+from modeldeck.gui import PipelinePanel, RoleEditor  # noqa: E402
 from modeldeck.state import default_state, recommended_serving_settings  # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
@@ -128,6 +128,28 @@ class RoleEditorProfileAndNativeToolCallingTests(unittest.TestCase):
         # settings must not fabricate a recommendation for a model it
         # doesn't know) is fully covered at the layer that owns it.
         self.assertIsNone(recommended_serving_settings("some-org/totally-unrecognized-model"))
+
+
+class PipelinePanelFlowTests(unittest.TestCase):
+    """The Reports tab grew a Feature/Troubleshoot flow selector; picking a
+    flow reshapes the "Start from" dropdown to that flow's phases."""
+
+    def test_feature_flow_offers_the_scout_led_phases(self) -> None:
+        panel = PipelinePanel()
+        phases = [panel.start_phase.itemData(i) for i in range(panel.start_phase.count())]
+        self.assertEqual(phases, ["scout", "planner", "builder", "auditor"])
+
+    def test_switching_to_troubleshoot_swaps_scout_for_diagnose(self) -> None:
+        panel = PipelinePanel()
+        panel.flow.setCurrentIndex(panel.flow.findData("troubleshoot"))
+        phases = [panel.start_phase.itemData(i) for i in range(panel.start_phase.count())]
+        self.assertEqual(phases, ["diagnose", "planner", "builder", "auditor"])
+
+    def test_a_shared_start_phase_survives_the_flow_switch(self) -> None:
+        panel = PipelinePanel()
+        panel.start_phase.setCurrentIndex(panel.start_phase.findData("builder"))
+        panel.flow.setCurrentIndex(panel.flow.findData("troubleshoot"))
+        self.assertEqual(panel.start_phase.currentData(), "builder")
 
 
 if __name__ == "__main__":

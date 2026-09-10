@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 
 from report_common import (
     DEFAULT_CHAR_BUDGET,
+    DEFAULT_TEST_TIMEOUT,
     char_budget_for_role,
     DEFAULT_EXTENSIONS,
     DEFAULT_ROUTER_URL,
@@ -33,61 +33,12 @@ from report_common import (
     call_model,
     collect_files,
     describe_skipped,
+    detect_test_command,
     read_required_artifact,
     resolve_ai_path,
+    run_test_suite,
     write_report,
 )
-
-# Long test output eats context fast without adding much signal past a
-# point -- keep enough to see the failure, drop the rest with a clear note.
-MAX_TEST_OUTPUT_CHARS = 8_000
-DEFAULT_TEST_TIMEOUT = 120.0
-
-
-def detect_test_command(path: Path) -> str | None:
-    """Best-effort guess at how to run this project's tests, or None if
-    nothing recognizable is found -- Auditor is one-shot and tool-free, so
-    it cannot run tests itself; this is the only way its verdict can be
-    grounded in an actual pass/fail result instead of reasoning about test
-    *source* and guessing whether it would pass. Found live, the hard way:
-    a REJECT-worthy defect (a test that genuinely failed) got a false PASS
-    because Auditor read a model's own inconclusive prose about the test
-    and mistook "the model talked itself into believing this was fixed"
-    for "this is fixed" -- it had no way to check."""
-    root = path if path.is_dir() else path.parent
-    if (root / "Package.swift").exists():
-        return "swift test"
-    has_pytest_style_tests = any(
-        p.name.startswith("test_") or p.name.endswith("_test.py")
-        for p in root.glob("*.py")
-    ) or any(root.rglob("test_*.py")) or any(root.rglob("*_test.py"))
-    if has_pytest_style_tests:
-        venv_python = root / ".venv" / "bin" / "python"
-        python = str(venv_python) if venv_python.exists() else sys.executable
-        return f"{python} -m pytest"
-    return None
-
-
-def run_test_suite(path: Path, command: str, timeout: float) -> str:
-    """Runs command in path and returns a plain-text block describing what
-    actually happened -- exit code and (possibly truncated) combined
-    output. Never raises: a timeout or a command that itself fails to
-    launch is reported as text, same as any other test result, since a
-    test suite that can't even run is itself a finding."""
-    root = path if path.is_dir() else path.parent
-    try:
-        result = subprocess.run(
-            command, shell=True, cwd=root, capture_output=True, text=True,
-            timeout=timeout,
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        if len(output) > MAX_TEST_OUTPUT_CHARS:
-            output = output[:MAX_TEST_OUTPUT_CHARS] + f"\n...[truncated, {len(output)} chars total]"
-        return f"$ {command}\nExit code: {result.returncode}\n{output}"
-    except subprocess.TimeoutExpired:
-        return f"$ {command}\nTIMED OUT after {timeout}s -- treat this as a finding, not as \"tests pass\"."
-    except OSError as exc:
-        return f"$ {command}\nFailed to run: {exc}"
 
 SYSTEM_PROMPT = f"""You are a focused implementation-audit assistant. {NO_TOOLS_NOTICE} \
 Do not edit anything; you are producing an audit report, not a fix.

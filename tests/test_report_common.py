@@ -8,11 +8,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import subprocess
+
 from report_common import (  # noqa: E402
     DEFAULT_CHAR_BUDGET,
     DEFAULT_EXTENSIONS,
     collect_files,
     describe_skipped,
+    git_changed_files,
+    git_repro_context,
     looks_like_failed_tool_call,
     char_budget_for_role,
     parse_builder_accuracy,
@@ -20,6 +24,95 @@ from report_common import (  # noqa: E402
     referenced_files,
     resolve_ai_path,
 )
+
+
+def _git_repo(root: Path) -> None:
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@t.t"],
+        ["config", "user.name", "t"],
+        ["config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+class GitContextTests(unittest.TestCase):
+    def test_returns_empty_string_outside_a_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(git_repro_context(Path(directory)), "")
+            self.assertEqual(git_changed_files(Path(directory)), set())
+
+    def test_surfaces_recent_commits_and_the_uncommitted_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _git_repo(root)
+            (root / "app.py").write_text("x = 1\n")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "add app"], cwd=root, check=True, capture_output=True,
+            )
+            (root / "app.py").write_text("x = 2\n")
+
+            context = git_repro_context(root)
+            self.assertIn("add app", context)
+            self.assertIn("-x = 1", context)
+            self.assertIn("+x = 2", context)
+            self.assertEqual(
+                git_changed_files(root), {str((root / "app.py").resolve())},
+            )
+
+    def test_counts_an_untracked_file_as_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _git_repo(root)
+            (root / "new.py").write_text("y = 1\n")
+            self.assertIn(str((root / "new.py").resolve()), git_changed_files(root))
+
+
+class EnsureNonemptyReportTests(unittest.TestCase):
+    def test_raises_on_a_too_short_response(self) -> None:
+        from report_common import ReportError, ensure_nonempty_report
+        with self.assertRaises(ReportError):
+            ensure_nonempty_report("   \n  ", phase="diagnose")
+        with self.assertRaises(ReportError):
+            ensure_nonempty_report("too short", phase="diagnose")
+
+    def test_passes_a_real_report_through_unchanged(self) -> None:
+        from report_common import ensure_nonempty_report
+        body = "# Diagnosis\n\n" + ("root cause analysis. " * 40)
+        self.assertEqual(ensure_nonempty_report(body, phase="diagnose"), body)
+
+
+class ReadRequiredArtifactTests(unittest.TestCase):
+    def test_an_empty_artifact_is_rejected_by_default(self) -> None:
+        from report_common import ReportError, read_required_artifact
+        with tempfile.TemporaryDirectory() as directory:
+            p = Path(directory) / "diagnosis-report.md"
+            p.write_text("   \n")
+            with self.assertRaises(ReportError):
+                read_required_artifact(p, produced_by="scripts/diagnose_report.py")
+
+    def test_allow_empty_opts_out(self) -> None:
+        from report_common import read_required_artifact
+        with tempfile.TemporaryDirectory() as directory:
+            p = Path(directory) / "x.md"
+            p.write_text("")
+            self.assertEqual(read_required_artifact(p, produced_by="x", allow_empty=True), "")
+
+
+class ImportersOfTests(unittest.TestCase):
+    def test_finds_a_module_that_imports_a_changed_file(self) -> None:
+        from report_common import importers_of
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "core.js").write_text("export const x = 1;\n")
+            (root / "app.js").write_text("import { x } from './core.js';\n")
+            (root / "unrelated.js").write_text("const y = 2;\n")
+            hits = importers_of([root / "core.js"], root, {".js"})
+            names = {p.name for p in hits}
+            self.assertIn("app.js", names)
+            self.assertNotIn("unrelated.js", names)
+            self.assertNotIn("core.js", names)
 
 
 class CollectFilesSwiftPackageTests(unittest.TestCase):

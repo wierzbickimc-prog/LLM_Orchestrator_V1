@@ -12,48 +12,86 @@ from typing import Any, Callable
 from .mtplx import PROJECT_DIR, ProcessManager, fetch_sse_snapshot
 from .state import activate_local, activate_planner, load_state, save_state
 
-# Constants moved from gui.py
+# build_args receives (task, path, flow) -- flow is "feature" or
+# "troubleshoot" and only matters where the two flows feed a phase
+# different inputs (Planner: a scout report vs. a diagnosis report).
 REPORT_SCRIPTS: dict[str, dict[str, Any]] = {
     "scout": {
         "script": "scout_report.py",
         "task_required": True,
         "out": ".ai/scout-report.md",
-        "build_args": lambda task, path: [task, path],
+        "build_args": lambda task, path, flow: [task, path],
+    },
+    "diagnose": {
+        "script": "diagnose_report.py",
+        "task_required": True,
+        "out": ".ai/diagnosis-report.md",
+        "build_args": lambda task, path, flow: [task, path],
     },
     "planner": {
         "script": "planner_report.py",
         "task_required": False,
         "out": ".ai/implementation-plan.md",
-        "build_args": lambda task, path: [path, *(["--task", task] if task else [])],
+        "build_args": lambda task, path, flow: [
+            path,
+            *(["--task", task] if task else []),
+            *(
+                [
+                    "--troubleshoot",
+                    "--scout-report",
+                    str(resolve_ai_path(Path(path), "diagnosis-report.md")),
+                ]
+                if flow == "troubleshoot" else []
+            ),
+        ],
     },
     "builder": {
         "script": "builder_agent.py",
         "task_required": False,
         "out": ".ai/builder-report.md",
-        "build_args": lambda task, path: [path, *(["--task", task] if task else [])],
+        "build_args": lambda task, path, flow: [path, *(["--task", task] if task else [])],
     },
     "auditor": {
         "script": "auditor_report.py",
         "task_required": False,
         "out": ".ai/audit-report.md",
-        "build_args": lambda task, path: [path, *(["--task", task] if task else [])],
+        "build_args": lambda task, path, flow: [path, *(["--task", task] if task else [])],
     },
     "renovator": {
         "script": "renovator_agent.py",
         "task_required": False,
         "out": ".ai/renovator-report.md",
-        "build_args": lambda task, path: [path],
+        "build_args": lambda task, path, flow: [path],
     },
 }
 
 PIPELINE_ORDER: tuple[str, ...] = ("scout", "planner", "builder", "auditor")
-STATUS_PHASES: tuple[str, ...] = PIPELINE_ORDER + ("renovator",)
+# Troubleshoot swaps Scout's open-ended survey for a diff-anchored Diagnose
+# phase; Planner/Builder/Auditor downstream are unchanged (Planner just
+# reads .ai/diagnosis-report.md instead of .ai/scout-report.md).
+TROUBLESHOOT_ORDER: tuple[str, ...] = ("diagnose", "planner", "builder", "auditor")
+FLOW_ORDERS: dict[str, tuple[str, ...]] = {
+    "feature": PIPELINE_ORDER,
+    "troubleshoot": TROUBLESHOOT_ORDER,
+}
+STATUS_PHASES: tuple[str, ...] = ("scout", "diagnose", "planner", "builder", "auditor", "renovator")
 MAX_RENOVATOR_RETRIES = 1
+
+# Diagnose has no role of its own -- it runs on the Auditor's model/config
+# (same defect-finding task). This maps the phase name to the role the
+# process manager should have resident and the alias the script calls.
+PHASE_ROLE_OVERRIDE: dict[str, str] = {"diagnose": "auditor"}
+
 REQUIRED_ARTIFACT_FOR_START: dict[str, str] = {
     "scout": "",
     "planner": "scout-report.md",
     "builder": "implementation-plan.md",
     "auditor": "implementation-plan.md",
+}
+TROUBLESHOOT_REQUIRED_ARTIFACT_FOR_START: dict[str, str] = {
+    **REQUIRED_ARTIFACT_FOR_START,
+    "diagnose": "",
+    "planner": "diagnosis-report.md",
 }
 
 # Add scripts directory to path for report_common imports
@@ -73,6 +111,7 @@ class Pipeline:
         self.event_sink = event_sink
         self.pipeline_queue: list[str] = []
         self.pipeline_mode: str | None = None
+        self.pipeline_flow: str = "feature"
         self.pipeline_task: str = ""
         self.pipeline_path: str = ""
         self.pipeline_current_phase: str | None = None
@@ -84,24 +123,32 @@ class Pipeline:
         self._last_prefill_rate: dict[str, float] = {}
 
     def start(
-        self, mode: str, path: str, task: str, start_phase: str
+        self, mode: str, path: str, task: str, start_phase: str, flow: str = "feature"
     ) -> dict[str, Any]:
         if not path:
             return {"error": "Path required"}
-        if start_phase == "scout" and not task:
+        order = FLOW_ORDERS.get(flow, PIPELINE_ORDER)
+        if start_phase not in order:
+            return {"error": f"{start_phase!r} is not a phase in the {flow} flow"}
+        if start_phase == order[0] and not task:
             return {"error": "Task required"}
 
-        required = REQUIRED_ARTIFACT_FOR_START.get(start_phase, "")
+        required_map = (
+            TROUBLESHOOT_REQUIRED_ARTIFACT_FOR_START if flow == "troubleshoot"
+            else REQUIRED_ARTIFACT_FOR_START
+        )
+        required = required_map.get(start_phase, "")
         if required:
             required_path = resolve_ai_path(Path(path), required)
             if not required_path.exists():
                 return {"error": f"Missing prerequisite: {required_path}"}
 
         self.pipeline_mode = mode
+        self.pipeline_flow = flow
         self.pipeline_task = task
         self.pipeline_path = path
-        start_index = PIPELINE_ORDER.index(start_phase)
-        self.pipeline_queue = list(PIPELINE_ORDER[start_index:])
+        start_index = order.index(start_phase)
+        self.pipeline_queue = list(order[start_index:])
         self.pipeline_renovator_retries = 0
         self._pipeline_resident_role = None
         self.report_start_times = {}
@@ -110,7 +157,7 @@ class Pipeline:
         self._last_prefill_rate = {}
 
         # Emit skipped phases
-        for skipped_phase in PIPELINE_ORDER[:start_index]:
+        for skipped_phase in order[:start_index]:
             self.event_sink({
                 "type": "phase_status",
                 "phase": skipped_phase,
@@ -147,7 +194,7 @@ class Pipeline:
         if phase == "planner":
             activate_planner(state)
         else:
-            activate_local(state, phase)
+            activate_local(state, PHASE_ROLE_OVERRIDE.get(phase, phase))
         save_state(state)
 
     def _phase_local_role(self, phase: str) -> str | None:
@@ -159,7 +206,7 @@ class Pipeline:
             if state["planner"].get("kind") == "local":
                 return "planner"
             return None
-        return phase
+        return PHASE_ROLE_OVERRIDE.get(phase, phase)
 
     def _ensure_role_resident(self, role_name: str | None) -> None:
         if role_name is None:
@@ -236,7 +283,7 @@ class Pipeline:
         config = REPORT_SCRIPTS[phase]
         python = PROJECT_DIR / ".venv" / "bin" / "python"
         script_path = PROJECT_DIR / "scripts" / config["script"]
-        args = [str(a) for a in config["build_args"](task, path)]
+        args = [str(a) for a in config["build_args"](task, path, self.pipeline_flow)]
 
         # Agentic phases get their turn budget from role config, so it is
         # visible and editable in the Deck tab rather than buried as a

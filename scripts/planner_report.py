@@ -71,6 +71,19 @@ SCOPE_NOTE_FULL_SCAN = (
     "doesn't match what a file actually contains, note that discrepancy in "
     "the plan rather than silently working around it."
 )
+SCOPE_NOTE_TROUBLESHOOT = (
+    "The report above is a REGRESSION DIAGNOSIS, not a scout survey: it has "
+    "already identified a root cause (file and line) and a minimal fix. Do "
+    "not re-open the investigation or widen the scope. Your plan is that fix, "
+    "precisely: the exact edit to make, plus a regression test that would "
+    "have caught this. The Builder cannot open a browser or click through a "
+    "UI -- write the plan so it can be executed purely by editing files and "
+    "running the test command. Only if the diagnosis explicitly says it "
+    "could NOT isolate the cause should you plan an investigation; otherwise "
+    "verify the named root cause against the file contents below and, if it "
+    "holds, plan the fix directly. Note any point where the diagnosis "
+    "disagrees with what a file actually contains."
+)
 
 
 def main() -> int:
@@ -94,6 +107,11 @@ def main() -> int:
         "--full-context", action="store_true",
         help="scan the whole tree instead of only the files the scout report cites",
     )
+    parser.add_argument(
+        "--troubleshoot", action="store_true",
+        help="the input report is a regression diagnosis (troubleshoot flow), not a "
+        "scout survey -- plan the identified fix directly rather than re-investigating",
+    )
     parser.add_argument("--dry-run", action="store_true", help="collect and report file stats without calling the model")
     args = parser.parse_args()
     if args.scout_report is None:
@@ -103,15 +121,28 @@ def main() -> int:
     if args.char_budget is None:
         args.char_budget = char_budget_for_role("planner")
 
+    input_label = "diagnosis report" if args.troubleshoot else "scout report"
+    producer = "scripts/diagnose_report.py" if args.troubleshoot else "scripts/scout_report.py"
     try:
-        scout_report = read_required_artifact(args.scout_report, produced_by="scripts/scout_report.py")
+        scout_report = read_required_artifact(args.scout_report, produced_by=producer)
     except ReportError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     extensions = set(args.ext) if args.ext else DEFAULT_EXTENSIONS
     files: list[Path] = [] if args.full_context else referenced_files(scout_report, args.path)
-    if files:
+    if args.troubleshoot:
+        # The diagnosis names the root-cause file(s); read those (plus any
+        # others it cites) and let the model verify the named cause against
+        # them. No full-scan fallback -- an empty diagnosis was already
+        # rejected by read_required_artifact above.
+        scope_note = SCOPE_NOTE_TROUBLESHOOT
+        if files:
+            print(f"Diagnosis cites {len(files)} resolvable file(s); reading those.")
+        else:
+            files = collect_files(args.path, extensions)
+            print("Diagnosis cited no resolvable files -- reading a full scan for verification.", file=sys.stderr)
+    elif files:
         print(f"Scout report cites {len(files)} resolvable file(s); reading only those.")
         scope_note = SCOPE_NOTE_CITED
     else:
@@ -121,10 +152,10 @@ def main() -> int:
                 file=sys.stderr,
             )
         files = collect_files(args.path, extensions)
-        if not files:
-            print(f"No matching files under {args.path}", file=sys.stderr)
-            return 1
         scope_note = SCOPE_NOTE_FULL_SCAN
+    if not files:
+        print(f"No matching files under {args.path}", file=sys.stderr)
+        return 1
 
     context, included, skipped = build_context(files, args.char_budget, cache_target=args.path)
     print(f"Included {len(included)} file(s), {len(context):,} chars.")
@@ -137,7 +168,7 @@ def main() -> int:
         return 0
 
     user_content = (
-        f"Scout report ({args.scout_report}):\n{scout_report}\n\n"
+        f"{input_label.capitalize()} ({args.scout_report}):\n{scout_report}\n\n"
         + (f"Additional note from the requester:\n{args.task}\n\n" if args.task else "")
         + f"Repository files:\n{context}"
         + describe_skipped(skipped)

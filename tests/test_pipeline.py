@@ -15,6 +15,7 @@ from modeldeck.pipeline import (
     Pipeline,
     REQUIRED_ARTIFACT_FOR_START,
     STATUS_PHASES,
+    TROUBLESHOOT_ORDER,
 )
 
 
@@ -134,6 +135,79 @@ class TestQueueConstruction:
         assert self.pipeline.pipeline_queue == ["builder", "auditor"]
         skipped_events = [e for e in collector if e.get("type") == "phase_status" and "skipped" in e.get("status", "")]
         assert len(skipped_events) == 2  # scout and planner skipped
+
+
+# ---------------------------------------------------------------------------
+# Troubleshoot flow
+# ---------------------------------------------------------------------------
+
+class TestTroubleshootFlow:
+    def setup_method(self):
+        reset_collector()
+        self.manager = FakeManager()
+        self.pipeline = Pipeline(self.manager, make_state, make_sink())
+
+    @patch("modeldeck.pipeline.resolve_ai_path")
+    def test_start_at_diagnose_builds_the_troubleshoot_queue(self, mock_resolve):
+        mock_resolve.return_value = _mock_path(exists_val=True)
+        with patch.object(self.pipeline, "run_next") as mock_run:
+            mock_run.return_value = {"status": "running", "phase": "diagnose"}
+            self.pipeline.start("full", "/tmp/project", "it broke", "diagnose", "troubleshoot")
+        assert self.pipeline.pipeline_queue == ["diagnose", "planner", "builder", "auditor"]
+        assert self.pipeline.pipeline_flow == "troubleshoot"
+
+    def test_scout_is_not_a_phase_in_the_troubleshoot_flow(self):
+        result = self.pipeline.start("full", "/tmp/project", "task", "scout", "troubleshoot")
+        assert "error" in result
+
+    @patch("modeldeck.pipeline.resolve_ai_path")
+    def test_planner_in_troubleshoot_flow_needs_the_diagnosis_report(self, mock_resolve):
+        mock_resolve.return_value = _mock_path(exists_val=False)
+        result = self.pipeline.start("full", "/tmp/project", "task", "planner", "troubleshoot")
+        assert "Missing prerequisite" in result["error"]
+
+    def test_diagnose_phase_runs_on_the_auditor_role(self):
+        assert self.pipeline._phase_local_role("diagnose") == "auditor"
+
+    def test_planner_args_point_at_the_diagnosis_report_in_troubleshoot_flow(self):
+        self.pipeline.pipeline_flow = "troubleshoot"
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.StringIO("Wrote /tmp/out/report.md\n")
+        mock_proc.wait.return_value = 0
+        mock_proc.stdin = MagicMock()
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with patch("modeldeck.pipeline.PROJECT_DIR", Path("/tmp/fake")):
+                with patch.object(Path, "read_text", return_value="plan"):
+                    self.pipeline._pipeline_worker("planner", "task", "/tmp/project")
+        argv = mock_popen.call_args[0][0]
+        assert "--scout-report" in argv
+        assert argv[argv.index("--scout-report") + 1].endswith("diagnosis-report.md")
+
+    def test_planner_gets_the_troubleshoot_flag_in_troubleshoot_flow(self):
+        self.pipeline.pipeline_flow = "troubleshoot"
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.StringIO("Wrote /tmp/out/report.md\n")
+        mock_proc.wait.return_value = 0
+        mock_proc.stdin = MagicMock()
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with patch("modeldeck.pipeline.PROJECT_DIR", Path("/tmp/fake")):
+                with patch.object(Path, "read_text", return_value="plan"):
+                    self.pipeline._pipeline_worker("planner", "task", "/tmp/project")
+        assert "--troubleshoot" in mock_popen.call_args[0][0]
+
+    def test_feature_flow_planner_args_have_no_scout_report_override(self):
+        self.pipeline.pipeline_flow = "feature"
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.StringIO("Wrote /tmp/out/report.md\n")
+        mock_proc.wait.return_value = 0
+        mock_proc.stdin = MagicMock()
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with patch("modeldeck.pipeline.PROJECT_DIR", Path("/tmp/fake")):
+                with patch.object(Path, "read_text", return_value="plan"):
+                    self.pipeline._pipeline_worker("planner", "task", "/tmp/project")
+        argv = mock_popen.call_args[0][0]
+        assert "--scout-report" not in argv
+        assert "--troubleshoot" not in argv
 
 
 # ---------------------------------------------------------------------------
