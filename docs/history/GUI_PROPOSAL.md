@@ -1,17 +1,18 @@
-# Model Deck desktop workflow
+# Historical Model Deck desktop workflow
 
 > This describes the original **Deck** tab (still accurate, below). Model
 > Deck later gained a second **Reports** tab that runs the four-phase
-> pipeline directly against the router with no Cline involved -- see the
-> README's "The four-phase pipeline, without Cline" section and
-> `docs/ARCHITECTURE.md` for why, and `docs/NEXT_STEPS.md` for current status.
+> pipeline directly against the router with no chat extension involved -- see
+> the repository README's "The routed pipeline" section and
+> `../ARCHITECTURE.md` for the current design.
 
-Model Deck is a native macOS control plane for Cline, MTPLX, and an OpenAI GPT
-Planner. Cline is configured once with the local gateway and never needs to know
+Model Deck is a native macOS control plane for a chat client, MTPLX, and an
+OpenAI GPT Planner. The client is configured once with the local gateway and
+never needs to know
 which inference backend is active.
 
 ```text
-Cline: http://127.0.0.1:8100/v1 · model local
+Client: http://127.0.0.1:8100/v1 · model local
                          |
                     Model Deck
        +-----------------+------------------+
@@ -37,7 +38,7 @@ be assigned any valid MTPLX pack discovered by `mtplx models --json`.
 
 The left side contains:
 
-- the stable Cline endpoint and current phase;
+- the stable client endpoint and current phase;
 - one-click Scout, GPT Planner, Build, and Audit transitions;
 - the requested **Launch Models** button;
 - GPT model/reasoning selection and Keychain credential status;
@@ -65,7 +66,7 @@ document expected from each role, and a copyable request block for every phase.
 - It stops a model only when the listener PID matches a PID recorded by this
   project.
 - It refuses to replace an unknown process occupying a configured port.
-- GPT credentials never enter Cline payloads, project files, or logs.
+- GPT credentials never enter client payloads, project files, or logs.
 - Restart-required settings are applied during phase launch, never silently in
   the middle of a request.
 

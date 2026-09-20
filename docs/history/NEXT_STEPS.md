@@ -1,9 +1,12 @@
-# Status and Next Steps
+# Historical status and next steps
+
+> Archived snapshot. It is retained as implementation history, not as the
+> current project backlog. See the repository README and current workflow plans.
 
 Everything in this file's previous version (MTPLX launch inspection, tool-call
 verification, Scout/Builder testing, the file-based handoff) is done. See the
-README's "The four-phase pipeline, without Cline" section for the current
-design and why it changed from the original Cline-centric plan.
+README's "The routed pipeline" section for the current design and why it
+changed from the original chat-extension-centric plan.
 
 ## Done
 
@@ -41,9 +44,9 @@ design and why it changed from the original Cline-centric plan.
   hasn't been observed.
 - Planner-via-cloud-GPT needs a funded OpenAI API account (a ChatGPT
   subscription does not include API credits -- they're billed separately).
-- `docs/GUI_PROPOSAL.md`, `docs/LAUNCHER_PLAN.md`, and
-  `docs/ARCHITECTURE.md` have not been reviewed against tonight's changes
-  and may still describe the earlier Cline-centric design.
+- `docs/history/GUI_PROPOSAL.md`, `docs/history/LAUNCHER_PLAN.md`, and
+  `docs/ARCHITECTURE.md` had not been reviewed against that night's changes
+  and may still describe the earlier chat-extension-centric design.
 - An embedded terminal panel for Claude Code / Codex inside Model Deck was
   discussed (real terminal via `QWebEngineView` + `xterm.js` + a pty bridge
   over `QWebSockets`, both confirmed available) but not built -- blocked on

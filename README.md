@@ -1,4 +1,4 @@
-# Local Cline Router
+# LLM Orchestrator
 
 Local router and phase launcher for a two-model coding workflow on an M1 Max
 64 GB MacBook Pro.
@@ -13,74 +13,48 @@ Double-click **Model Deck** on the macOS Desktop, or launch it from a terminal:
 
 The desktop app has two tabs:
 
-- **Deck** -- keeps Cline on one stable configuration (`http://127.0.0.1:8100/v1`,
-  model `local`), selects the GPT-5.6 Sol Planner or one locally resident MTPLX
-  role, displays live request telemetry, and stores the OpenAI key in macOS
-  Keychain. Still useful for ad-hoc coding with Cline.
+- **Deck** -- keeps any OpenAI-compatible chat client on one stable configuration
+  (`http://127.0.0.1:8100/v1`, model `local`), selects the GPT-5.6 Sol Planner or
+  one locally resident MTPLX role, displays live request telemetry, and stores
+  the OpenAI key in macOS Keychain. Still useful for ad-hoc coding in an editor.
 - **Reports** -- runs Scout/Planner/Builder/Auditor directly against the
-  router, with no chat extension involved. See "The four-phase pipeline,
-  without Cline" below for why this exists and how it differs from the Deck
-  tab's copyable prompts.
+  router, with no chat extension involved. See "The routed pipeline" below for
+  why this exists and how it differs from the Deck tab's copyable prompts.
 
-## The four-phase pipeline, without Cline
+## The routed pipeline
 
-Running Scout/Planner/Builder/Auditor *through* Cline turned out to be
-fragile in ways specific to going through a general-purpose coding-agent
-chat extension: Cline's own system prompt carries an unconditional "always
-present your plan first" instruction that fights a summarizer's actual job,
-its `environment_details` block and tool-schema overhead inflate context on
-every turn, and mtplx's `--tool-prompt-mode hybrid` bridge (needed to
-translate Cline's OpenAI-style `tools` field into this model family's native
-call format) can emit a malformed `<tool_call>` that stalls the whole turn.
+The Reports tab runs purpose-built Scout/Planner/Builder/Auditor scripts.
+Scout (or Diagnose for troubleshooting) emits an evidence-backed complexity
+assessment. The tram map shows two routes from that first station:
 
-`scripts/{scout,planner,builder,auditor}_report.py` are small, purpose-built
-alternatives, runnable from the CLI or the Model Deck **Reports** tab:
+- Simple: Qwen3.6 Balance Planner → Builder → Auditor.
+- Complex or uncertain: Qwen3.8 Quality Planner → Builder → Auditor.
 
-- **Scout, Planner, Auditor** (`scout_report.py`, `planner_report.py`,
-  `auditor_report.py`) are one-shot, tool-free calls: the *script* walks the
-  file tree and reads files directly, hands the content to the model as
-  plain text, and saves whatever comes back. No `tools` field is ever sent,
-  so mtplx's hybrid tool-call bridge never activates for these -- there's
-  nothing for it to intercept.
-- Planner reads only the specific files Scout's report cites (see
-  `report_common.referenced_files`), not the whole tree -- re-ingesting
-  everything Scout already read would defeat the point of Scout being a
-  cheaper summarizer. Auditor still scans the whole tree deliberately: part
-  of its job is catching changes the plan never called for, which requires
-  seeing files a narrower scope would never surface.
-- **Builder** (`builder_agent.py`) is the one script that actually edits
-  files and runs commands, so it needs real multi-step tool use. It still
-  avoids the OpenAI `tools` field and mtplx's hybrid bridge: it uses a
-  simple convention the *script* parses itself -- one fenced ` ```tool `
-  JSON block per turn for `read_file`/`write_file`/`run_command`, plain text
-  with no such block to signal completion. Not sandboxed beyond staying
-  inside the target path -- read `.ai/implementation-plan.md` before running
-  it, and try it on a low-stakes target first.
+Both routes require the same implementation-plan and work-item handoff.
+Builder never has to invent a missing plan. Sensitive planned paths, broad
+changes, open questions, incomplete coverage, and prior failures override a
+simple assessment. Missing/malformed assessments select the complex route.
+Operator overrides remain explicit, and a failed simple plan can escalate once.
+The selected route, model, assessment, and reason are recorded in the run journal
+and displayed on desktop/mobile. Step mode shows the decision after Scout while
+waiting for Continue. Cloud planning is optional and is labelled separately.
 
-Each artifact (`.ai/scout-report.md`, `.ai/implementation-plan.md`,
-`.ai/builder-report.md`, `.ai/audit-report.md`) is written inside the
-*target project*, not this repo, regardless of where Model Deck itself is
-installed.
+Scout and Planner are tool-free report calls. Builder and Renovator use native
+tool calls by default; the older fenced-tool protocol remains available for
+compatibility. The native runtime path avoids the legacy hybrid bridge that
+motivated moving the workflow out of a chat extension. Builder executes dependency-ordered
+work items in fresh conversations and records verification in a progress ledger.
+Auditor uses the run diff, source context, and actual checks. Disputed/high-risk
+findings can trigger the read-only Verifier before a bounded repair pass.
 
-Planner can also run entirely locally instead of against the cloud GPT
-backend -- set the Deck tab's GPT Planner "Backend" to "Local model" and
-pick which resident role (Scout/Builder/Auditor) to route through. Useful
-when the OpenAI account has no credits, or you'd rather not spend them on
-planning.
+Artifacts live under the target project's `.ai/`, including `scout-report.md`,
+`implementation-plan.md`, `work-items.json`, `builder-report.md`, and
+`audit-report.md`. An external chat client remains supported for ad-hoc coding
+through `local`.
 
-The Deck tab's copyable Scout/Planner/Builder/Auditor prompts (see
-[`docs/GUI_PROPOSAL.md`](docs/GUI_PROPOSAL.md)) still work for ad-hoc coding
-with Cline; they're just no longer the primary way to run the four-phase
-pipeline.
-
-## Goal
-
-Use:
-- **Scout / Explore model**: Qwen3.6-35B-A3B MTPLX speed-optimized
-- **Builder / Coding model**: Qwen3.8-27B Q4 / MTPLX speed-optimized
-- **MTPLX** as the preferred inference runtime
-- **Cline in VS Code** as the coding agent UX
-- A small local **OpenAI-compatible routing layer** only if needed to bridge multiple local model servers/endpoints
+The deployment uses FP16-compatible MTPLX builds on the M1 Max. Their main
+weights are quantized: Balance is mostly 6-bit and Quality is 8-bit. Only one
+local model is resident at a time.
 
 ## Intended architecture
 
@@ -88,7 +62,7 @@ Use:
 VS Code
   |
   v
-Cline
+Chat extension (optional, ad-hoc coding only)
   |
   v
 Local OpenAI-compatible Router
@@ -99,6 +73,11 @@ Active phase endpoint
   `-- builder -> Qwen3.8-27B
 
 Only one MTPLX model is resident at a time.
+
+Model transitions are serialized across the desktop app, web service, and
+`scripts/stack.sh`. A launch is recorded before its health endpoint opens, and
+the next launch is not allowed to begin until the previous MTPLX process has
+exited. This also makes Stop effective while model weights are still loading.
 ```
 
 ## Project status
@@ -106,8 +85,8 @@ Only one MTPLX model is resident at a time.
 The router and Model Deck desktop controller are implemented. The router exposes
 OpenAI-compatible model discovery and streaming/non-streaming chat completions.
 Model Deck discovers validated MTPLX models, switches one local model into RAM at
-a time, selects the GPT planner without changing Cline, and displays MTPLX health
-and per-request telemetry.
+a time, selects the GPT planner without reconfiguring any client, and displays
+MTPLX health and per-request telemetry.
 
 The remaining validation work is to exercise a paid OpenAI request with the
 user's Keychain-stored API key and benchmark the complete four-phase workflow on
@@ -162,32 +141,53 @@ processes that it launched.
 Model references and ports can be overridden with environment variables such as
 `SCOUT_MODEL`, `BUILDER_MODEL`, `SCOUT_PORT`, and `BUILDER_PORT`.
 
-The defaults use the sequential workflow validated on this 64 GB Mac:
+Fresh-install defaults match the reviewed local deployment baseline:
 
-| Role | Model | Context | KV | RAM bank total/per session | SSD bank |
-| --- | --- | ---: | --- | ---: | ---: |
-| Scout | Qwen3.6-35B-A3B Speed | 100K | Q8 | 16 GB / 12 GB | 10 GB |
-| Builder | Qwen3.8-27B Speed | 100K | Q8 | 16 GB / 12 GB | 10 GB |
+| Role | Artifact | Thinking / effort | Profile / MTP depth | KV | Context ceiling |
+| --- | --- | --- | --- | --- | ---: |
+| Scout | Qwen3.6 Balance FP16 | on / unsupported | sustained / 1 | off | 131,072 |
+| Simple Planner | Qwen3.6 Balance FP16 | on / unsupported | sustained / 1 | off | 131,072 |
+| Complex Planner / Verifier | Qwen3.8 Quality FP16 | on / medium | turbo / 3 | Q8 | 131,072 |
+| Builder / Renovator | Qwen3.8 Quality FP16 | off / inactive | turbo / 3 | Q8 | 131,072 |
+| Auditor / Diagnose | Qwen3.6 Balance FP16 | on / unsupported | sustained / 1 | off | 131,072 |
 
-(12 GB per session covers the full 100K context window's KV cache at the
-default density; smaller values evict mid-session on long agentic runs and
-force expensive full reprocessing instead of a cache hit.)
+Planner defaults to a scoped input target of approximately 24K tokens (character
+estimate), including Scout's report and the task; explicit `--char-budget` can
+override it. Planner/Verifier completions are capped at 16K/8K tokens respectively.
+Qwen3.6 has no effort tiers. Qwen3.8 exposes low/medium/xhigh, and its effort
+control is inactive when thinking is off. Internal mode changes select the
+corresponding sampling preset; same-mode calls retain operator sampling edits.
 
-Both roles use Smart fan control, explicit MTP depth 3, serial/latency
-scheduling, 2048-token prefill chunks, and automatic medium-effort reasoning.
+All roles retain serial/latency scheduling, Smart fans, 2,048-token prefill
+chunks, and RAM session-bank limits of 16G total / 12G per session / eight entries.
+SSD caching is off; its configured 10G ceiling is inactive. These are cache limits,
+not a measured total-memory requirement. Chat/Prompt development use Speed with
+D1 and Q8 KV. Ornith is optional and has its own .6/.95/20 thinking preset;
+neutral penalties are local choices, not a claimed publisher recommendation.
 
-Override them with `SCOUT_CONTEXT_WINDOW`, `BUILDER_CONTEXT_WINDOW`,
-`SCOUT_KV_QUANTIZATION`, `BUILDER_KV_QUANTIZATION`,
-`SCOUT_SESSION_BANK_MAX`, `BUILDER_SESSION_BANK_MAX`,
-`SCOUT_SESSION_BANK_PER_SESSION_MAX`, `BUILDER_SESSION_BANK_PER_SESSION_MAX`,
-`SCOUT_SSD_SESSION_CACHE_MAX`, and `BUILDER_SSD_SESSION_CACHE_MAX`.
-Performance controls can be changed with `SCOUT_DEPTH`, `BUILDER_DEPTH`,
-`FAN_MODE`, `PREFILL_CHUNK_TOKENS`, and `SESSION_BANK_MAX_ENTRIES`.
+Saved settings in `~/Library/Application Support/Model Deck/state.json` override
+fresh defaults across the GUI, web, and shell launchers. Existing operator model,
+context, and sampling choices are retained when loading; unsupported effort tiers
+normalize to auto. Use the Deck editors (including Simple Planner), or inspect
+resolved serving settings and overrides:
 
-The longer-term model-selecting desktop control panel is described in
-[`docs/LAUNCHER_PLAN.md`](docs/LAUNCHER_PLAN.md).
+```bash
+.venv/bin/python -m modeldeck.launch show --json
+```
 
-## Cline target configuration
+A missing optional simple-planner artifact selects the configured complex planner
+for automatic routing. An explicit forced route does not silently change class;
+preflight reports the missing artifact. Launchers check availability before
+stopping a resident model and do not download models implicitly.
+
+The model-card comparison, local measurements, and limitations are recorded in
+[the tuning review](docs/MODEL_TUNING_REVIEW_2026-09-19.md).
+
+The implemented desktop control plane is described in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); superseded proposals are kept
+under `docs/history/`.
+
+## Chat client configuration
 
 Use an OpenAI-compatible provider and point it at:
 
@@ -202,26 +202,49 @@ local
 ```
 
 The router resolves `local` to the phase selected in Model Deck. Legacy `scout`
-and `builder` aliases remain available for direct testing, but Cline should stay
-on `local` so phase changes require no settings edits.
+and `builder` aliases remain available for direct testing, but a client should
+stay on `local` so phase changes require no settings edits.
 
 ## Important design principle
 
-This started as "Cline remains the agent; stay a thin model gateway unless
-testing demonstrates otherwise." Testing demonstrated otherwise: running the
-four-phase pipeline through Cline hit tool-call fragility, an unavoidable
-"always present a plan" bias in Cline's own system prompt, and per-turn
-context overhead that a summarizer role shouldn't be paying. The router
-stays a thin gateway either way -- it doesn't know or care whether a request
-came from Cline, from `scripts/*_report.py`, or from Continue -- but the
-orchestration for the four-phase pipeline itself now lives in those scripts
-and the Model Deck Reports tab, not in Cline. See "The four-phase pipeline,
-without Cline" above.
+This started as "a chat extension remains the agent; stay a thin model gateway
+unless testing demonstrates otherwise." Testing demonstrated otherwise: running
+the four-phase pipeline through an extension hit tool-call fragility, an
+unavoidable "always present a plan" bias in the extension's own system prompt,
+and per-turn context overhead that a summarizer role shouldn't be paying. The
+router stays a thin gateway either way -- it doesn't know or care whether a
+request came from an editor extension or from `scripts/*_report.py` -- but the
+orchestration for the four-phase pipeline itself now lives in those scripts and
+the Model Deck Reports tab. See "The routed pipeline" above.
 
-Every script in `scripts/*_report.py` and `builder_agent.py` avoids the
-OpenAI `tools` field entirely, on both the read-only and the file-editing
-side: mtplx's `--tool-prompt-mode hybrid` bridge (needed to translate that
-field into this model family's native call format) is what produced the
-malformed-tool-call stalls that motivated this whole redesign in the first
-place. Prefer a convention your own code parses and recovers from over a
-bridge you don't control, for any future phase added here.
+One-shot report calls do not declare tools. Agentic phases use MTPLX's native
+tool-call path with explicit parsing and verification. The old hybrid bridge
+is not the default for these phases.
+
+## Remote Tailnet Access (mobile / phone)
+
+The router serves a responsive, dependency-free web UI (`router/static/index.html` + `app.js`) for the Deck, Reports, and Admin tabs. Its Deck exposes the same workflow roles, model inventory, reasoning/serving/sampling controls, presets, activation, and shutdown operations as the desktop Deck; both call shared transition logic and persist one configuration. When the desktop GUI owns a pipeline run, the phone automatically attaches to that same run: streamed text, phase state, completion output, and questions are replayed from one sequenced journal rather than starting a second session. Reconnecting resumes at the last received event. All pipeline operations and file I/O remain local.
+
+### How to enable
+
+1. Set the bind address by adding to your .env (or exporting in your shell):
+   ROUTER_HOST=0.0.0.0   # or your exact Tailscale IP, e.g. 100.x.y.z
+
+   The default is 127.0.0.1 (loopback only). Changing it to 0.0.0.0 makes the server reachable on all local interfaces. This is safe because the router's source-IP allowlist middleware rejects any request not coming from 127.0.0.1, the Tailscale CGNAT range (100.64.0.0/10), or CIDRs you configure via TAILSCALE_CIDRS.
+
+2. Start the web server in its own terminal:
+   python -m router.main
+
+   (This is separate from scripts/run_model_deck.sh, which launches the desktop PySide6 GUI. You can run both concurrently if desired.)
+
+3. Open the URL on your phone's browser:
+   http://<your-tailscale-ip>:8100/
+
+   Replace <your-tailscale-ip> with the machine's Tailscale address (visible in the Tailscale dashboard or tailscale status).
+
+### Security notes
+
+- Allowlist gate: Requests from non-Tailscale, non-loopback IPs receive 403 Access denied. The allowlist is the authoritative security boundary; binding on 0.0.0.0 is acceptable only because of it.
+- Firewall: If you do not want direct LAN/WAN access to port 8100, configure your host firewall to block it. The allowlist mitigates remote exposure, but a local attacker on the same network could reach the socket before the middleware checks the source IP.
+- Cleartext over the tunnel: Tailscale encrypts the tunnel end-to-end, so cleartext HTTP inside the tunnel is fine. No TLS reverse proxy is required for this use case.
+- Optional CIDRs: If your Tailscale network uses a custom CGNAT range, set TAILSCALE_CIDRS=100.100.0.0/16,100.101.0.0/16 (comma-separated) to extend the allowlist.

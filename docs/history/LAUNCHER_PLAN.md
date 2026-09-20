@@ -1,4 +1,7 @@
-# Launcher plan
+# Historical launcher plan
+
+> Archived after the desktop launcher was implemented. See `../ARCHITECTURE.md`
+> and the repository README for the current design.
 
 The implemented desktop direction and phase contract are specified in
 [`GUI_PROPOSAL.md`](GUI_PROPOSAL.md).
@@ -11,7 +14,7 @@ separate OpenAI-compatible service on port 8100.
 
 ## Desktop GUI
 
-Build a small Python desktop application after the dual-model Cline workflow is
+Build a small Python desktop application after the dual-model chat workflow is
 validated. The first version should be a control plane, not another inference
 runtime.
 
@@ -26,7 +29,7 @@ Core controls:
 - Mutual exclusion so Scout and Builder are not resident at the same time
 - A memory estimate and warning before launch, based on model weights, context,
   KV quantization, and session-bank caps
-- Copyable Cline base URL and a one-click API compatibility test
+- Copyable client base URL and a one-click API compatibility test
 
 Implementation direction:
 
@@ -39,5 +42,5 @@ Implementation direction:
 
 ## Validation gate
 
-Do not build the GUI until Cline has completed real tool-using tasks through both
+Do not build the GUI until a chat client has completed real tool-using tasks through both
 aliases. Those tests determine which controls actually belong in the launcher.
